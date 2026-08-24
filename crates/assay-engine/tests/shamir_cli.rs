@@ -122,6 +122,74 @@ fn journal_path(out: &std::path::Path) -> std::path::PathBuf {
     value.into()
 }
 
+async fn downgrade_transition_audit_to_pre_schema_migrated(vault_path: &std::path::Path) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(vault_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE sealing_transition_audit RENAME TO audit_with_schema_migrated")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE sealing_transition_audit (
+            transition_id TEXT PRIMARY KEY,
+            old_kid TEXT NOT NULL,
+            new_kid TEXT NOT NULL,
+            old_method TEXT NOT NULL,
+            new_method TEXT NOT NULL,
+            operator_id TEXT NOT NULL,
+            backup_ref TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            backup_generation TEXT NOT NULL,
+            baseline_binary_digest TEXT NOT NULL,
+            database_artifact_digests TEXT NOT NULL,
+            bundle_digest TEXT NOT NULL,
+            share_threshold INTEGER NOT NULL,
+            share_count INTEGER NOT NULL,
+            plaintext_backup_acknowledged INTEGER NOT NULL,
+            outcome TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sealing_transition_audit
+            (transition_id,old_kid,new_kid,old_method,new_method,operator_id,
+             backup_ref,manifest_digest,backup_generation,baseline_binary_digest,
+             database_artifact_digests,bundle_digest,share_threshold,share_count,
+             plaintext_backup_acknowledged,outcome,created_at)
+         SELECT transition_id,old_kid,new_kid,old_method,new_method,operator_id,
+                backup_ref,manifest_digest,backup_generation,baseline_binary_digest,
+                database_artifact_digests,bundle_digest,share_threshold,share_count,
+                plaintext_backup_acknowledged,outcome,created_at
+           FROM audit_with_schema_migrated",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE audit_with_schema_migrated")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+fn remove_schema_migrated_from_journal(out: &std::path::Path) {
+    let path = journal_path(out);
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    journal.as_object_mut().unwrap().remove("schema_migrated");
+    std::fs::write(path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+}
+
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
@@ -1126,6 +1194,109 @@ async fn recovery_accepts_pre_schema_migrated_prepared_and_committed_journals() 
             String::from_utf8_lossy(&recovered.stderr)
         );
     }
+}
+
+#[tokio::test]
+async fn pre_schema_migrated_prepared_plaintext_journal_retries_without_backup_drift() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let vault_path = config.parent().unwrap().join("vault.db");
+    downgrade_transition_audit_to_pre_schema_migrated(&vault_path).await;
+    let out = config.parent().unwrap().join("old-prepared-plaintext.json");
+    let killed = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_KILL_POINT", "bundle-fsynced-precommit")
+        .output()
+        .unwrap();
+    assert!(!killed.status.success());
+    remove_schema_migrated_from_journal(&out);
+    let has_column = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&vault_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('sealing_transition_audit')
+         WHERE name='schema_migrated'",
+    )
+    .fetch_one(&has_column)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    has_column.close().await;
+    let recovered = authorized_command(&config, &out).output().unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+}
+
+#[tokio::test]
+async fn pre_schema_migrated_audit_recovers_prepared_and_committed_shamir() {
+    for point in ["db-committed-prejournal", "postcommit"] {
+        let (_tmp, config, pool) = fixture().await;
+        pool.close().await;
+        let out = config
+            .parent()
+            .unwrap()
+            .join(format!("old-audit-{point}.json"));
+        let killed = authorized_command(&config, &out)
+            .env("ASSAY_TEST_SHAMIR_KILL_POINT", point)
+            .output()
+            .unwrap();
+        assert!(!killed.status.success());
+        downgrade_transition_audit_to_pre_schema_migrated(
+            &config.parent().unwrap().join("vault.db"),
+        )
+        .await;
+        remove_schema_migrated_from_journal(&out);
+        let recovered = authorized_command(&config, &out).output().unwrap();
+        assert!(
+            recovered.status.success(),
+            "{point}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn tampered_pre_schema_migrated_audit_receipt_is_refused() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("old-audit-tampered.json");
+    let killed = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_KILL_POINT", "db-committed-prejournal")
+        .output()
+        .unwrap();
+    assert!(!killed.status.success());
+    let vault_path = config.parent().unwrap().join("vault.db");
+    downgrade_transition_audit_to_pre_schema_migrated(&vault_path).await;
+    remove_schema_migrated_from_journal(&out);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(vault_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sealing_transition_audit SET manifest_digest='tampered'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let recovery = authorized_command(&config, &out).output().unwrap();
+    assert!(!recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovery.stderr).contains("audit receipt mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
 }
 
 #[tokio::test]

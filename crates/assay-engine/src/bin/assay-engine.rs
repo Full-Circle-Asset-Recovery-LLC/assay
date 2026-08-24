@@ -825,19 +825,34 @@ async fn validate_transition_audit_receipt(
     conn: &mut sqlx::SqliteConnection,
     journal: &TransitionJournal,
 ) -> anyhow::Result<()> {
-    let row: TransitionAuditRow = sqlx::query_as(
+    let has_schema_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('sealing_transition_audit')
+            WHERE name='schema_migrated'
+        )",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| anyhow::anyhow!("inspect transition audit receipt schema: {error}"))?;
+    let schema_expression = if has_schema_migrated {
+        "schema_migrated"
+    } else {
+        "0 AS schema_migrated"
+    };
+    let query = format!(
         "SELECT transition_id, old_kid, new_kid, operator_id, backup_ref,
                 manifest_digest, backup_generation, baseline_binary_digest,
                 database_artifact_digests, bundle_digest, share_threshold,
-                share_count, plaintext_backup_acknowledged, outcome
-                , schema_migrated
+                share_count, plaintext_backup_acknowledged, outcome,
+                {schema_expression}
            FROM vault.sealing_transition_audit
-          WHERE transition_id=?",
-    )
-    .bind(&journal.transition_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|error| anyhow::anyhow!("read transition audit receipt: {error}"))?;
+          WHERE transition_id=?"
+    );
+    let row: TransitionAuditRow = sqlx::query_as(&query)
+        .bind(&journal.transition_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| anyhow::anyhow!("read transition audit receipt: {error}"))?;
     if row.transition_id != journal.transition_id
         || row.old_kid != journal.old_kid
         || row.new_kid != journal.new_kid
