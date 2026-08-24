@@ -105,18 +105,46 @@ impl ProcessLock {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
-        if !data_dir.is_absolute() {
-            anyhow::bail!("missing SQLite data directory path must be canonical and absolute");
-        }
-        let parent = data_dir
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("missing SQLite data directory has no parent"))?;
-        if parent.canonicalize()? != parent {
-            anyhow::bail!("SQLite data directory parent must be canonical and non-symlinked");
-        }
-        let name = data_dir.file_name().ok_or_else(|| {
-            anyhow::anyhow!("missing SQLite data directory has no final component")
-        })?;
+        let (parent, name) = if data_dir.is_absolute() {
+            if data_dir
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                anyhow::bail!("SQLite data directory traversal is refused");
+            }
+            let parent = data_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("missing SQLite data directory has no parent"))?
+                .to_path_buf();
+            if parent.canonicalize()? != parent {
+                anyhow::bail!("SQLite data directory parent must be canonical and non-symlinked");
+            }
+            let name = data_dir
+                .file_name()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing SQLite data directory has no final component")
+                })?
+                .to_os_string();
+            (parent, name)
+        } else {
+            let normal = data_dir
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::CurDir => None,
+                    std::path::Component::Normal(value) => Some(Ok(value.to_os_string())),
+                    std::path::Component::ParentDir => Some(Err(anyhow::anyhow!(
+                        "SQLite data directory traversal is refused"
+                    ))),
+                    _ => Some(Err(anyhow::anyhow!(
+                        "relative SQLite data directory must be one final component"
+                    ))),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if normal.len() != 1 {
+                anyhow::bail!("relative SQLite data directory must be one final component");
+            }
+            (std::env::current_dir()?.canonicalize()?, normal[0].clone())
+        };
         let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes())?;
         let name_c = std::ffi::CString::new(name.as_bytes())?;
         // SAFETY: canonical parent path is NUL-terminated; returned fd is owned below.
@@ -132,7 +160,7 @@ impl ProcessLock {
         }
         // SAFETY: parent_fd is newly owned.
         let parent_file = unsafe { File::from_raw_fd(parent_fd) };
-        Self::validate_private_directory(&parent_file, "SQLite data directory parent")?;
+        Self::validate_trusted_parent(&parent_file)?;
         // SAFETY: parent fd and final-component name are valid.
         if unsafe { libc::mkdirat(parent_file.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error()).context("mkdirat SQLite data directory");
@@ -177,6 +205,29 @@ impl ProcessLock {
             || stat.st_mode & 0o077 != 0
         {
             anyhow::bail!("{label} must be operator-owned mode 0700 or stricter");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn validate_trusted_parent(parent: &File) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fd is valid and stat points to writable memory.
+        if unsafe { libc::fstat(parent.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect SQLite data directory trusted parent");
+        }
+        // SAFETY: fstat succeeded.
+        let stat = unsafe { stat.assume_init() };
+        let effective_uid = unsafe { libc::geteuid() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || (stat.st_uid != effective_uid && stat.st_uid != 0)
+            || stat.st_mode & 0o022 != 0
+        {
+            anyhow::bail!(
+                "SQLite data directory trusted parent must be a non-group/world-writable directory owned by the operator or root"
+            );
         }
         Ok(())
     }
@@ -348,5 +399,11 @@ mod tests {
         symlink(&real_parent, &linked_parent).unwrap();
         assert!(ProcessLock::acquire(&linked_parent.join("data")).is_err());
         drop(guard);
+    }
+
+    #[test]
+    fn root_owned_nonwritable_system_parent_is_trusted() {
+        let parent = File::open("/var/lib").unwrap();
+        ProcessLock::validate_trusted_parent(&parent).unwrap();
     }
 }

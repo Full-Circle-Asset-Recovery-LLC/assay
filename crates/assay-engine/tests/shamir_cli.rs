@@ -1621,3 +1621,95 @@ async fn engine_boot_creates_missing_data_dir_mode_0700_under_umask_0002() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+fn relative_data_dir_config(
+    root: &std::path::Path,
+    port: u16,
+    data_dir: Option<&str>,
+) -> std::path::PathBuf {
+    let config = root.join("engine.toml");
+    let data_dir_line = data_dir
+        .map(|value| format!("data_dir='{value}'\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind_addr='127.0.0.1:{port}'\n[backend]\ntype='sqlite'\n{data_dir_line}[auth]\nadmin_api_keys=['synthetic-test-key']\n[logging]\nlevel='error'\n"
+        ),
+    )
+    .unwrap();
+    config
+}
+
+fn relative_data_dir_child(config: &std::path::Path, cwd: &std::path::Path) -> Child {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_assay-engine"));
+    command
+        .args(["serve", "--config"])
+        .arg(config)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec changes only the child process umask before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    command.spawn().unwrap()
+}
+
+#[tokio::test]
+async fn default_relative_data_dir_boots_and_creates_mode_0700() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let port = free_port();
+    let config = relative_data_dir_config(temp.path(), port, None);
+    let mut child = relative_data_dir_child(&config, temp.path());
+    let client = direct_test_client();
+    wait_ready(&client, &mut child, port).await;
+    assert_eq!(
+        std::fs::metadata(temp.path().join("data"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn relative_data_dir_rejects_group_writable_cwd_and_parent_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+    let config = relative_data_dir_config(temp.path(), free_port(), None);
+    let result = relative_data_dir_child(&config, temp.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("trusted parent"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!temp.path().join("data").exists());
+
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let child_dir = temp.path().join("child");
+    std::fs::create_dir(&child_dir).unwrap();
+    std::fs::set_permissions(&child_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let traversal = relative_data_dir_config(&child_dir, free_port(), Some("../data"));
+    let result = relative_data_dir_child(&traversal, &child_dir)
+        .wait_with_output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("traversal"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

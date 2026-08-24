@@ -98,7 +98,11 @@ pub enum BackendConfig {
     Sqlite {
         /// Directory holding the per-module SQLite files
         /// (`<data_dir>/engine.db`, `<data_dir>/workflow.db`, …). Created
-        /// on startup if missing. Defaults to `./data`. Use `:memory:`
+        /// on startup if missing. Defaults to `./data`, resolved as one
+        /// final component beneath the canonical current directory. Its
+        /// parent must be owned by the operator or root and must not be
+        /// group/world writable; the new directory is created mode 0700.
+        /// Use `:memory:`
         /// in `path` (legacy) or set `data_dir = ":memory:"` to keep the
         /// engine purely in-memory for tests.
         #[serde(default = "default_data_dir")]
