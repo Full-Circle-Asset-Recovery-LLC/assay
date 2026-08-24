@@ -265,6 +265,22 @@ CREATE TABLE IF NOT EXISTS vault.unseal_shares (
     PRIMARY KEY (kid, share_index)
 );
 
+CREATE TABLE IF NOT EXISTS vault.sealing_transition_audit (
+    transition_id   TEXT PRIMARY KEY,
+    old_kid         TEXT NOT NULL,
+    new_kid         TEXT NOT NULL,
+    old_method      TEXT NOT NULL,
+    new_method      TEXT NOT NULL,
+    operator_id     TEXT NOT NULL,
+    backup_ref      TEXT NOT NULL,
+    bundle_digest   TEXT NOT NULL,
+    share_threshold INTEGER NOT NULL,
+    share_count     INTEGER NOT NULL,
+    plaintext_backup_acknowledged BOOLEAN NOT NULL,
+    outcome         TEXT NOT NULL,
+    created_at      DOUBLE PRECISION NOT NULL
+);
+
 -- ── S8: audit forwarding sinks ────────────────────────────────────
 -- One row per configured forwarder. `kind` ∈ {syslog, s3, webhook};
 -- `config` carries kind-specific JSON (host/port for syslog, bucket /
@@ -496,6 +512,24 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
             encrypted_share  BLOB NOT NULL,
             created_at       REAL NOT NULL,
             PRIMARY KEY (kid, share_index)
+        )",
+    ),
+    (
+        "sealing_transition_audit",
+        "CREATE TABLE IF NOT EXISTS vault.sealing_transition_audit (
+            transition_id   TEXT PRIMARY KEY,
+            old_kid         TEXT NOT NULL,
+            new_kid         TEXT NOT NULL,
+            old_method      TEXT NOT NULL,
+            new_method      TEXT NOT NULL,
+            operator_id     TEXT NOT NULL,
+            backup_ref      TEXT NOT NULL,
+            bundle_digest   TEXT NOT NULL,
+            share_threshold INTEGER NOT NULL,
+            share_count     INTEGER NOT NULL,
+            plaintext_backup_acknowledged INTEGER NOT NULL,
+            outcome         TEXT NOT NULL,
+            created_at      REAL NOT NULL
         )",
     ),
     // ── S8: audit forwarding sinks ───────────────────────────────
