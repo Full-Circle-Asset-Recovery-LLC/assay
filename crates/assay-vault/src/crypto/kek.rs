@@ -35,6 +35,12 @@ struct KekInner {
     key: [u8; KEY_LEN],
 }
 
+impl Drop for KekInner {
+    fn drop(&mut self) {
+        self.key.fill(0);
+    }
+}
+
 /// Fully-resolved wrapped DEK — the bytes the storage layer puts on
 /// disk. Layout: `nonce (12) || wrapped DEK ciphertext (32+16 = 48)`.
 /// Total 60 bytes. Stored as a single BYTEA / BLOB column.

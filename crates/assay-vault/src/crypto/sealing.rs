@@ -84,12 +84,21 @@ pub mod shamir {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Share(pub Vec<u8>);
 
+    impl Drop for Share {
+        fn drop(&mut self) {
+            self.0.fill(0);
+        }
+    }
+
     impl Share {
         pub fn from_bytes(b: Vec<u8>) -> Self {
             Self(b)
         }
         pub fn as_bytes(&self) -> &[u8] {
             &self.0
+        }
+        pub fn into_bytes(mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0)
         }
     }
 

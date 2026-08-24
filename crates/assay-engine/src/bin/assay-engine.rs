@@ -136,6 +136,8 @@ async fn offline_init_shamir(
     if data_dir == ":memory:" {
         anyhow::bail!("offline Shamir initialization requires persistent SQLite files");
     }
+    let _process_lock =
+        assay_engine::process_lock::ProcessLock::acquire(std::path::Path::new(&data_dir))?;
     let engine_path = std::path::Path::new(&data_dir).join("engine.db");
     let vault_path = std::path::Path::new(&data_dir).join("vault.db");
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.create_if_missing(false);
@@ -188,14 +190,19 @@ async fn offline_init_shamir(
             anyhow::bail!("a live engine instance is registered; stop it before offline migration");
         }
         let operational: i64 = sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM vault.kv) +
+            "SELECT (SELECT COUNT(*) FROM vault.kv_meta) +
+                    (SELECT COUNT(*) FROM vault.kv) +
+                    (SELECT COUNT(*) FROM vault.transit_keys) +
                     (SELECT COUNT(*) FROM vault.transit_versions) +
                     (SELECT COUNT(*) FROM vault.leases) +
                     (SELECT COUNT(*) FROM vault.vaults) +
                     (SELECT COUNT(*) FROM vault.collections) +
                     (SELECT COUNT(*) FROM vault.collection_members) +
                     (SELECT COUNT(*) FROM vault.items) +
-                    (SELECT COUNT(*) FROM vault.folders)",
+                    (SELECT COUNT(*) FROM vault.folders) +
+                    (SELECT COUNT(*) FROM vault.share_revoked) +
+                    (SELECT COUNT(*) FROM vault.unseal_shares) +
+                    (SELECT COUNT(*) FROM vault.audit_sinks)",
         )
         .fetch_one(&mut *conn)
         .await

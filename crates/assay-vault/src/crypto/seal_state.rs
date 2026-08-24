@@ -48,6 +48,32 @@ pub struct SealStateInner {
     pub share_threshold: Option<u8>,
     pub share_count: Option<u8>,
     kek_digest: Option<[u8; 32]>,
+    pending_activation: bool,
+}
+
+pub struct PendingKek {
+    kid: String,
+    handle: KekHandle,
+}
+
+impl PendingKek {
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+}
+
+pub enum ShareSubmission {
+    Progress(SealStatus),
+    Ready(PendingKek),
+}
+
+impl ShareSubmission {
+    pub fn status(&self) -> Option<&SealStatus> {
+        match self {
+            Self::Progress(status) => Some(status),
+            Self::Ready(_) => None,
+        }
+    }
 }
 
 /// Cheap clonable wrapper.
@@ -71,6 +97,7 @@ impl SealState {
                 share_threshold: None,
                 share_count: None,
                 kek_digest: None,
+                pending_activation: false,
             })),
         }
     }
@@ -99,6 +126,7 @@ impl SealState {
                 share_threshold: Some(threshold),
                 share_count: Some(shares_count),
                 kek_digest: Some(kek_digest),
+                pending_activation: false,
             })),
         }
     }
@@ -109,6 +137,7 @@ impl SealState {
     pub fn seal(&self) -> Result<()> {
         let mut g = self.inner.write();
         g.handle = None;
+        g.pending_activation = false;
         match &g.method {
             SealingMethod::Shamir { threshold, .. } => {
                 g.accumulator = Some(UnsealAccumulator::new(*threshold));
@@ -144,12 +173,17 @@ impl SealState {
     /// the state transitions to unsealed and `status.sealed = false`.
     /// Pass the raw share bytes the operator received from `init`.
     #[cfg(feature = "vault-sealing-shamir")]
-    pub fn submit_shamir_share(&self, share_bytes: Vec<u8>) -> Result<SealStatus> {
+    pub fn submit_shamir_share(&self, share_bytes: Vec<u8>) -> Result<ShareSubmission> {
         use crate::crypto::sealing::shamir::{Share, combine_shares};
 
         let mut g = self.inner.write();
         if g.handle.is_some() {
             return Err(VaultError::Invalid("vault is already unsealed".into()));
+        }
+        if g.pending_activation {
+            return Err(VaultError::Invalid(
+                "a reconstructed KEK is awaiting persistence".into(),
+            ));
         }
         // Snapshot the read-only fields under the mutable lock before
         // taking the &mut borrow on accumulator — the borrow checker
@@ -161,10 +195,24 @@ impl SealState {
         let expected_digest = g
             .kek_digest
             .ok_or_else(|| VaultError::Invalid("Shamir KEK digest missing".into()))?;
+        if share_bytes.len() != 33 || !(1..=5).contains(&share_bytes[0]) {
+            g.accumulator = Some(UnsealAccumulator::new(threshold));
+            return Err(VaultError::Invalid(
+                "Shamir share must be canonical 33-byte form with index 1..=5".into(),
+            ));
+        }
+        let share_index = share_bytes[0];
         let acc = g
             .accumulator
             .as_mut()
             .ok_or_else(|| VaultError::Invalid("no unseal ceremony in progress".into()))?;
+
+        if acc.contains_index(share_index) {
+            *acc = UnsealAccumulator::new(threshold);
+            return Err(VaultError::Invalid(
+                "duplicate Shamir share index; ceremony reset".into(),
+            ));
+        }
 
         acc.push(Share::from_bytes(share_bytes));
 
@@ -194,21 +242,22 @@ impl SealState {
                      corrupted or tampered share."
                 )));
             }
-            let handle = KekHandle::from_bytes(kid, key);
-            g.handle = Some(handle);
+            let handle = KekHandle::from_bytes(kid.clone(), key);
             g.accumulator = None;
+            g.pending_activation = true;
+            return Ok(ShareSubmission::Ready(PendingKek { kid, handle }));
         }
 
         // Status snapshot under the same write lock so the caller sees
         // a consistent post-state.
-        Ok(SealStatus {
+        Ok(ShareSubmission::Progress(SealStatus {
             method: g.method.clone(),
             sealed: g.handle.is_none(),
             kid: g.kid.clone(),
             shares_progress: g.accumulator.as_ref().map(|a| a.len() as u8).unwrap_or(0),
             share_threshold: g.share_threshold,
             share_count: g.share_count,
-        })
+        }))
     }
 
     /// Replace the active KEK (for KEK rotation / KMS auto-unseal).
@@ -217,6 +266,28 @@ impl SealState {
         g.kid = Some(kid);
         g.handle = Some(handle);
         g.accumulator = None;
+        g.pending_activation = false;
+    }
+
+    pub fn activate_pending(&self, pending: PendingKek) -> Result<()> {
+        let mut g = self.inner.write();
+        if !g.pending_activation || g.kid.as_deref() != Some(pending.kid.as_str()) {
+            return Err(VaultError::Invalid(
+                "pending KEK does not match the active ceremony".into(),
+            ));
+        }
+        g.handle = Some(pending.handle);
+        g.pending_activation = false;
+        Ok(())
+    }
+
+    pub fn abort_pending_and_reset(&self) {
+        let mut g = self.inner.write();
+        g.handle = None;
+        g.pending_activation = false;
+        if let Some(threshold) = g.share_threshold {
+            g.accumulator = Some(UnsealAccumulator::new(threshold));
+        }
     }
 
     pub fn reset_sealed_shamir(
@@ -237,6 +308,7 @@ impl SealState {
         g.share_threshold = Some(threshold);
         g.share_count = Some(shares_count);
         g.kek_digest = Some(kek_digest);
+        g.pending_activation = false;
     }
 }
 
@@ -284,6 +356,13 @@ impl UnsealAccumulator {
     pub fn shares(&self) -> &[crate::crypto::sealing::shamir::Share] {
         &self.shares
     }
+
+    #[cfg(feature = "vault-sealing-shamir")]
+    fn contains_index(&self, index: u8) -> bool {
+        self.shares
+            .iter()
+            .any(|share| share.0.first() == Some(&index))
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +371,16 @@ mod tests {
     use super::*;
     use crate::crypto::aead::random_dek;
     use crate::crypto::sealing::shamir::{Share, split_kek};
+
+    fn submit(state: &SealState, bytes: Vec<u8>) -> Result<SealStatus> {
+        match state.submit_shamir_share(bytes)? {
+            ShareSubmission::Progress(status) => Ok(status),
+            ShareSubmission::Ready(pending) => {
+                state.activate_pending(pending)?;
+                Ok(state.status())
+            }
+        }
+    }
 
     #[test]
     fn unsealed_round_trip() {
@@ -316,15 +405,13 @@ mod tests {
 
         // First two shares — still sealed.
         for sh in &shares[..2] {
-            let st = s.submit_shamir_share(sh.as_bytes().to_vec()).unwrap();
+            let st = submit(&s, sh.as_bytes().to_vec()).unwrap();
             assert!(st.sealed);
         }
         assert_eq!(s.status().shares_progress, 2);
 
         // Third share trips the threshold.
-        let st = s
-            .submit_shamir_share(shares[2].as_bytes().to_vec())
-            .unwrap();
+        let st = submit(&s, shares[2].as_bytes().to_vec()).unwrap();
         assert!(!st.sealed, "threshold submission must unseal");
         // Reconstructed KEK matches the original — proven by wrapping
         // a known DEK on each side and comparing the unwrap result.
@@ -354,10 +441,8 @@ mod tests {
         let s = SealState::sealed_shamir(kid.clone(), digest, 3, 5);
 
         // Two good shares.
-        s.submit_shamir_share(shares[0].as_bytes().to_vec())
-            .unwrap();
-        s.submit_shamir_share(shares[1].as_bytes().to_vec())
-            .unwrap();
+        submit(&s, shares[0].as_bytes().to_vec()).unwrap();
+        submit(&s, shares[1].as_bytes().to_vec()).unwrap();
         // Garbled third share — combine either fails outright or
         // reconstructs a bogus key whose kid doesn't match. Both paths
         // reset the accumulator and return an error.
@@ -374,13 +459,9 @@ mod tests {
         assert!(s.status().sealed);
         assert_eq!(s.status().shares_progress, 0);
         // A fresh ceremony with the real shares should succeed.
-        s.submit_shamir_share(shares[0].as_bytes().to_vec())
-            .unwrap();
-        s.submit_shamir_share(shares[1].as_bytes().to_vec())
-            .unwrap();
-        let st = s
-            .submit_shamir_share(shares[2].as_bytes().to_vec())
-            .unwrap();
+        submit(&s, shares[0].as_bytes().to_vec()).unwrap();
+        submit(&s, shares[1].as_bytes().to_vec()).unwrap();
+        let st = submit(&s, shares[2].as_bytes().to_vec()).unwrap();
         assert!(!st.sealed);
     }
 
@@ -391,12 +472,11 @@ mod tests {
         let kid = crate::crypto::kek::mint_kid(&kek);
         let digest = crate::crypto::kek_store::full_kek_digest(&kek);
         let state = SealState::sealed_shamir(kid, digest, 3, 5);
-        state
-            .submit_shamir_share(shares[0].as_bytes().to_vec())
-            .unwrap();
-        state
-            .submit_shamir_share(shares[0].as_bytes().to_vec())
-            .unwrap();
+        assert!(
+            state
+                .submit_shamir_share(shares[0].as_bytes().to_vec())
+                .is_ok()
+        );
         assert!(
             state
                 .submit_shamir_share(shares[0].as_bytes().to_vec())
@@ -414,7 +494,7 @@ mod tests {
         let digest = crate::crypto::kek_store::full_kek_digest(&kek);
         let s = SealState::sealed_shamir(kid, digest, 3, 5);
         for sh in &shares[..3] {
-            s.submit_shamir_share(sh.as_bytes().to_vec()).unwrap();
+            submit(&s, sh.as_bytes().to_vec()).unwrap();
         }
         assert!(!s.status().sealed);
         s.seal().unwrap();
@@ -444,5 +524,49 @@ mod tests {
         assert_eq!(status.kid.as_deref(), Some(kid.as_str()));
         assert_eq!(status.share_threshold, Some(3));
         assert!(matches!(status.method, SealingMethod::Shamir { .. }));
+    }
+
+    #[test]
+    fn threshold_returns_pending_kek_without_exposing_it() {
+        let kek = random_dek();
+        let shares = split_kek(&kek, 3, 5).unwrap();
+        let kid = crate::crypto::kek::mint_kid(&kek);
+        let digest = crate::crypto::kek_store::full_kek_digest(&kek);
+        let state = SealState::sealed_shamir(kid, digest, 3, 5);
+        for share in &shares[..2] {
+            assert!(matches!(
+                state.submit_shamir_share(share.0.clone()).unwrap(),
+                ShareSubmission::Progress(_)
+            ));
+        }
+        let pending = match state.submit_shamir_share(shares[2].0.clone()).unwrap() {
+            ShareSubmission::Ready(pending) => pending,
+            ShareSubmission::Progress(_) => panic!("threshold must produce pending KEK"),
+        };
+        assert!(matches!(state.require_unsealed(), Err(VaultError::Sealed)));
+        state.activate_pending(pending).unwrap();
+        assert!(state.require_unsealed().is_ok());
+    }
+
+    #[test]
+    fn malformed_out_of_range_and_duplicate_shares_reset_immediately() {
+        let kek = random_dek();
+        let shares = split_kek(&kek, 3, 5).unwrap();
+        let kid = crate::crypto::kek::mint_kid(&kek);
+        let digest = crate::crypto::kek_store::full_kek_digest(&kek);
+        let state = SealState::sealed_shamir(kid, digest, 3, 5);
+
+        state.submit_shamir_share(shares[0].0.clone()).unwrap();
+        assert!(state.submit_shamir_share(vec![1, 2]).is_err());
+        assert_eq!(state.status().shares_progress, 0);
+
+        let mut out_of_range = shares[0].0.clone();
+        out_of_range[0] = 6;
+        assert!(state.submit_shamir_share(out_of_range).is_err());
+        assert_eq!(state.status().shares_progress, 0);
+
+        state.submit_shamir_share(shares[0].0.clone()).unwrap();
+        assert!(state.submit_shamir_share(shares[0].0.clone()).is_err());
+        assert_eq!(state.status().shares_progress, 0);
     }
 }

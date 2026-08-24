@@ -473,7 +473,11 @@ mod sealing {
                 crate::crypto::kek_store::init_shamir_postgres(&self.pool, threshold, shares_count)
                     .await
                     .map_err(|e| VaultError::Backend(anyhow::anyhow!("seal init_shamir: {e}")))?;
-            Ok((kid, digest, shares.into_iter().map(|s| s.0).collect()))
+            Ok((
+                kid,
+                digest,
+                shares.into_iter().map(|s| s.into_bytes()).collect(),
+            ))
         }
 
         async fn set_sealed(&self, kid: &str, sealed: bool) -> VaultResult<()> {

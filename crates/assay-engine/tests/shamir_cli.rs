@@ -268,3 +268,21 @@ async fn injected_failures_rollback_before_commit_and_retain_bundle_after_commit
         .unwrap();
     assert_eq!(method, "shamir");
 }
+
+#[tokio::test]
+async fn offline_init_refuses_process_lifetime_lock_even_without_heartbeat() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let _lock = assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()).unwrap();
+    let out = config.parent().unwrap().join("locked.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_assay-engine"))
+        .args(["vault", "init-shamir", "--config"])
+        .arg(&config)
+        .args(["--threshold", "3", "--shares", "5", "--shares-out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!out.exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("process holds"));
+}

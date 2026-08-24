@@ -28,12 +28,6 @@ use crate::transit::{TransitService, TransitStore};
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct VaultCtx {
-    /// Master KEK handle. Always present so KV / transit services can
-    /// hold a clone — but the live sealing state in `seal_state`
-    /// gates whether the handle is "trusted active" or stale (sealed).
-    /// Per-request handlers MUST consult `seal_state.require_unsealed()`
-    /// before touching key material.
-    pub kek: KekHandle,
     /// Runtime sealing state. Phase 2 introduces this; the engine boot
     /// path wires it from `vault.kek_metadata`. For first-boot /
     /// plaintext deployments it starts unsealed; for shamir-sealed
@@ -83,7 +77,6 @@ impl Default for VaultCtx {
         let seal_state =
             SealState::unsealed(SealingMethod::Plaintext, kek.kid().to_string(), kek.clone());
         Self {
-            kek,
             seal_state,
             seal_store: None,
             #[cfg(feature = "vault-kv")]
@@ -126,7 +119,6 @@ impl VaultCtx {
     pub fn with_kek(mut self, kek: KekHandle) -> Self {
         let seal_state =
             SealState::unsealed(SealingMethod::Plaintext, kek.kid().to_string(), kek.clone());
-        self.kek = kek;
         self.seal_state = seal_state;
         self
     }

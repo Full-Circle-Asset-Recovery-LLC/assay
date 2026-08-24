@@ -23,6 +23,21 @@ use crate::crypto::kek::KekHandle;
 /// Sealing method — the column value in `vault.kek_metadata`.
 pub const METHOD_PLAINTEXT: &str = "plaintext";
 pub const METHOD_SHAMIR: &str = "shamir";
+pub const OPERATIONAL_TABLES: &[&str] = &[
+    "kv_meta",
+    "kv",
+    "transit_keys",
+    "transit_versions",
+    "leases",
+    "vaults",
+    "collections",
+    "collection_members",
+    "items",
+    "folders",
+    "share_revoked",
+    "unseal_shares",
+    "audit_sinks",
+];
 
 /// Outcome of [`load_active_*`] — fully describes the at-rest state so
 /// engine boot can construct the right [`crate::crypto::seal_state::SealState`].
@@ -325,8 +340,19 @@ pub async fn init_shamir_sqlite(
         .context("begin exclusive shamir init")?;
     let occupied: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM vault.kek_metadata) +
+                (SELECT COUNT(*) FROM vault.kv_meta) +
                 (SELECT COUNT(*) FROM vault.kv) +
-                (SELECT COUNT(*) FROM vault.transit_versions)",
+                (SELECT COUNT(*) FROM vault.transit_keys) +
+                (SELECT COUNT(*) FROM vault.transit_versions) +
+                (SELECT COUNT(*) FROM vault.leases) +
+                (SELECT COUNT(*) FROM vault.vaults) +
+                (SELECT COUNT(*) FROM vault.collections) +
+                (SELECT COUNT(*) FROM vault.collection_members) +
+                (SELECT COUNT(*) FROM vault.items) +
+                (SELECT COUNT(*) FROM vault.folders) +
+                (SELECT COUNT(*) FROM vault.share_revoked) +
+                (SELECT COUNT(*) FROM vault.unseal_shares) +
+                (SELECT COUNT(*) FROM vault.audit_sinks)",
     )
     .fetch_one(&mut *conn)
     .await
@@ -672,6 +698,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operational_emptiness_contract_is_complete_and_biscuit_is_independent() {
+        assert_eq!(
+            OPERATIONAL_TABLES,
+            &[
+                "kv_meta",
+                "kv",
+                "transit_keys",
+                "transit_versions",
+                "leases",
+                "vaults",
+                "collections",
+                "collection_members",
+                "items",
+                "folders",
+                "share_revoked",
+                "unseal_shares",
+                "audit_sinks",
+            ]
+        );
+        assert!(!OPERATIONAL_TABLES.contains(&"biscuit_root_keys"));
+    }
+
     #[cfg(feature = "vault-sealing-shamir")]
     #[tokio::test]
     async fn restart_starts_sealed_and_same_shares_restore_kv_and_transit() {
@@ -684,7 +733,11 @@ mod tests {
         let (kid, digest, shares) = init_shamir_sqlite(&pool, 3, 5).await.unwrap();
         let first = SealState::sealed_shamir(kid.clone(), digest, 3, 5);
         for share in &shares[..3] {
-            first.submit_shamir_share(share.0.clone()).unwrap();
+            if let crate::crypto::seal_state::ShareSubmission::Ready(pending) =
+                first.submit_shamir_share(share.0.clone()).unwrap()
+            {
+                first.activate_pending(pending).unwrap();
+            }
         }
         let kv = KvService::new(SqliteKvStore::new(pool.clone()), first.clone());
         let transit = TransitService::new(SqliteTransitStore::new(pool.clone()), first);
@@ -709,7 +762,11 @@ mod tests {
         assert!(kv2.get("sentinel", None).await.is_err());
         assert!(transit2.decrypt("sentinel", &envelope).await.is_err());
         for share in &shares[..3] {
-            restarted.submit_shamir_share(share.0.clone()).unwrap();
+            if let crate::crypto::seal_state::ShareSubmission::Ready(pending) =
+                restarted.submit_shamir_share(share.0.clone()).unwrap()
+            {
+                restarted.activate_pending(pending).unwrap();
+            }
         }
         assert_eq!(
             kv2.get("sentinel", None).await.unwrap().plaintext,

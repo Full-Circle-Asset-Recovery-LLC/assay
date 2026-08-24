@@ -29,6 +29,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct InitBody {
     /// Number of shares operators receive.
     shares_count: u8,
@@ -37,6 +38,7 @@ struct InitBody {
 }
 
 #[derive(Serialize)]
+#[cfg(test)]
 struct InitResponse {
     kid: String,
     /// One base64-encoded share per entry. Operators MUST store these
@@ -54,36 +56,46 @@ where
     S: Clone + Send + Sync + 'static,
     VaultCtx: FromRef<S>,
 {
-    let store = match vault.seal_store.as_ref() {
-        Some(s) => s.clone(),
-        None => {
-            return vault_err_to_response(VaultError::Invalid(
-                "sealing backend not configured on this engine".into(),
-            ));
+    #[cfg(not(test))]
+    {
+        let _ = (vault, body);
+        vault_err_to_response(VaultError::Invalid(
+            "online Shamir initialization is disabled; use `assay-engine vault init-shamir` while the engine is stopped".into(),
+        ))
+    }
+    #[cfg(test)]
+    {
+        let store = match vault.seal_store.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return vault_err_to_response(VaultError::Invalid(
+                    "sealing backend not configured on this engine".into(),
+                ));
+            }
+        };
+        match store.init_shamir(body.threshold, body.shares_count).await {
+            Ok((kid, kek_digest, shares)) => {
+                // Re-prime the runtime SealState so subsequent /sys/unseal
+                // calls accumulate against the just-initialised KEK.
+                vault.seal_state.reset_sealed_shamir(
+                    kid.clone(),
+                    kek_digest,
+                    body.threshold,
+                    body.shares_count,
+                );
+                let resp = InitResponse {
+                    kid,
+                    shares_b64: shares
+                        .into_iter()
+                        .map(|s| data_encoding::BASE64.encode(&s))
+                        .collect(),
+                    threshold: body.threshold,
+                    shares_count: body.shares_count,
+                };
+                (StatusCode::CREATED, axum::Json(resp)).into_response()
+            }
+            Err(e) => vault_err_to_response(e),
         }
-    };
-    match store.init_shamir(body.threshold, body.shares_count).await {
-        Ok((kid, kek_digest, shares)) => {
-            // Re-prime the runtime SealState so subsequent /sys/unseal
-            // calls accumulate against the just-initialised KEK.
-            vault.seal_state.reset_sealed_shamir(
-                kid.clone(),
-                kek_digest,
-                body.threshold,
-                body.shares_count,
-            );
-            let resp = InitResponse {
-                kid,
-                shares_b64: shares
-                    .into_iter()
-                    .map(|s| data_encoding::BASE64.encode(&s))
-                    .collect(),
-                threshold: body.threshold,
-                shares_count: body.shares_count,
-            };
-            (StatusCode::CREATED, axum::Json(resp)).into_response()
-        }
-        Err(e) => vault_err_to_response(e),
     }
 }
 
@@ -155,20 +167,40 @@ where
         let share_bytes = match data_encoding::BASE64.decode(body.share_b64.as_bytes()) {
             Ok(b) => b,
             Err(_) => {
+                vault.seal_state.abort_pending_and_reset();
                 return vault_err_to_response(VaultError::Invalid(
                     "share_b64 is not valid base64".into(),
                 ));
             }
         };
         match vault.seal_state.submit_shamir_share(share_bytes) {
-            Ok(st) => {
-                if !st.sealed
-                    && let (Some(store), Some(kid)) = (vault.seal_store.as_ref(), st.kid.as_ref())
-                    && let Err(e) = store.set_sealed(kid, false).await
-                {
-                    let _ = vault.seal_state.seal();
+            Ok(crate::crypto::seal_state::ShareSubmission::Progress(st)) => {
+                axum::Json(SealStatusResponse {
+                    sealed: st.sealed,
+                    method: st.method.as_column().to_string(),
+                    kid: st.kid,
+                    shares_progress: st.shares_progress,
+                    share_threshold: st.share_threshold,
+                    share_count: st.share_count,
+                })
+                .into_response()
+            }
+            Ok(crate::crypto::seal_state::ShareSubmission::Ready(pending)) => {
+                let Some(store) = vault.seal_store.as_ref() else {
+                    vault.seal_state.abort_pending_and_reset();
+                    return vault_err_to_response(VaultError::Invalid(
+                        "sealing backend not configured on this engine".into(),
+                    ));
+                };
+                if let Err(e) = store.set_sealed(pending.kid(), false).await {
+                    vault.seal_state.abort_pending_and_reset();
                     return vault_err_to_response(e);
                 }
+                if let Err(e) = vault.seal_state.activate_pending(pending) {
+                    vault.seal_state.abort_pending_and_reset();
+                    return vault_err_to_response(e);
+                }
+                let st = vault.seal_state.status();
                 axum::Json(SealStatusResponse {
                     sealed: st.sealed,
                     method: st.method.as_column().to_string(),
@@ -239,7 +271,7 @@ mod tests {
         let shares = split_kek(&key, 3, 5)
             .unwrap()
             .into_iter()
-            .map(|s| s.0)
+            .map(|s| s.into_bytes())
             .collect::<Vec<_>>();
         let flags = Arc::new(Mutex::new(Vec::new()));
         let ctx = VaultCtx::new().with_seal_store(MemorySealStore {
@@ -263,6 +295,36 @@ mod tests {
         let status = ctx.seal_state.status();
         assert!(status.sealed);
         assert_eq!(status.kid.as_deref(), Some(kid.as_str()));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/sys/unseal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "share_b64": data_encoding::BASE64.encode(&shares[0])
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(ctx.seal_state.status().shares_progress, 1);
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::post("/sys/unseal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"share_b64":"%%%"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ctx.seal_state.status().shares_progress, 0);
 
         for (index, share) in shares.iter().take(3).enumerate() {
             let response = app
