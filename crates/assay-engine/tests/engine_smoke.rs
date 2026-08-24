@@ -41,7 +41,11 @@ impl EngineProcess {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private tempdir");
-        let db_path = tmp.path().join("engine.db");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).expect("data dir");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private data dir");
+        let db_path = data_dir.join("engine.db");
         let cfg_path = tmp.path().join("engine.toml");
 
         let cfg = format!(

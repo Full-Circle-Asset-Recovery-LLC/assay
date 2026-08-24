@@ -231,8 +231,11 @@ async fn unseal(
 async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, sqlx::SqlitePool) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let engine = tmp.path().join("engine.db");
-    let vault = tmp.path().join("vault.db");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = data_dir.join("engine.db");
+    let vault = data_dir.join("vault.db");
     let opts = SqliteConnectOptions::new()
         .filename(":memory:")
         .create_if_missing(true);
@@ -274,12 +277,12 @@ async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, sqlx::SqlitePool) 
     assay_vault::schema::migrate_sqlite(&pool).await.unwrap();
     load_or_init_sqlite(&pool).await.unwrap();
 
-    let config = tmp.path().join("engine.toml");
+    let config = data_dir.join("engine.toml");
     std::fs::write(
         &config,
         format!(
             "[server]\nbind_addr='127.0.0.1:0'\n[backend]\ntype='sqlite'\ndata_dir='{}'\n",
-            tmp.path().display()
+            data_dir.display()
         ),
     )
     .unwrap();
@@ -1661,6 +1664,24 @@ fn relative_data_dir_child(config: &std::path::Path, cwd: &std::path::Path) -> C
     command.spawn().unwrap()
 }
 
+fn wait_for_child_refusal(mut child: Child) -> std::process::Output {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "engine stayed alive instead of refusing path; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[tokio::test]
 async fn default_relative_data_dir_boots_and_creates_mode_0700() {
     let temp = tempfile::tempdir().unwrap();
@@ -1702,14 +1723,42 @@ fn relative_data_dir_rejects_group_writable_cwd_and_parent_traversal() {
     let child_dir = temp.path().join("child");
     std::fs::create_dir(&child_dir).unwrap();
     std::fs::set_permissions(&child_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let preexisting_parent_data = temp.path().join("data");
+    std::fs::create_dir(&preexisting_parent_data).unwrap();
+    std::fs::set_permissions(
+        &preexisting_parent_data,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let traversal = relative_data_dir_config(&child_dir, free_port(), Some("../data"));
-    let result = relative_data_dir_child(&traversal, &child_dir)
-        .wait_with_output()
-        .unwrap();
+    let result = wait_for_child_refusal(relative_data_dir_child(&traversal, &child_dir));
     assert!(!result.status.success());
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("traversal"),
         "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+
+    let nested = child_dir.join("nested/data");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let nested_config = relative_data_dir_config(&child_dir, free_port(), Some("nested/data"));
+    let result = wait_for_child_refusal(relative_data_dir_child(&nested_config, &child_dir));
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("one final component"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let real = child_dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let real_data = real.join("data");
+    std::fs::create_dir(&real_data).unwrap();
+    std::fs::set_permissions(&real_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, child_dir.join("linked")).unwrap();
+    let linked = relative_data_dir_config(&child_dir, free_port(), Some("linked/data"));
+    let result = wait_for_child_refusal(relative_data_dir_child(&linked, &child_dir));
+    assert!(!result.status.success());
 }

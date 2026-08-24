@@ -62,26 +62,20 @@ pub struct ProcessLock {
 
 impl ProcessLock {
     pub fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
-        let existed = match std::fs::symlink_metadata(data_dir) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error).context("inspect SQLite data directory for lock"),
-        };
-        if !existed {
-            #[cfg(unix)]
-            {
-                let dir = Self::create_missing_unix(data_dir)?;
-                return Self::acquire_unix(data_dir, Some(dir));
-            }
-            #[cfg(not(unix))]
-            std::fs::create_dir(data_dir).context("create SQLite data directory for lock")?;
-        }
         #[cfg(unix)]
         {
-            Self::acquire_unix(data_dir, None)
+            Self::acquire_unix(data_dir)
         }
         #[cfg(not(unix))]
         {
+            let existed = match std::fs::symlink_metadata(data_dir) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error).context("inspect SQLite data directory for lock"),
+            };
+            if !existed {
+                std::fs::create_dir(data_dir).context("create SQLite data directory for lock")?;
+            }
             use std::fs::OpenOptions;
             let path = data_dir.join("assay-engine.lock");
             let file = OpenOptions::new()
@@ -101,7 +95,7 @@ impl ProcessLock {
     }
 
     #[cfg(unix)]
-    fn create_missing_unix(data_dir: &Path) -> anyhow::Result<File> {
+    fn open_or_create_data_dir_unix(data_dir: &Path) -> anyhow::Result<File> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
@@ -161,10 +155,35 @@ impl ProcessLock {
         // SAFETY: parent_fd is newly owned.
         let parent_file = unsafe { File::from_raw_fd(parent_fd) };
         Self::validate_trusted_parent(&parent_file)?;
-        // SAFETY: parent fd and final-component name are valid.
-        if unsafe { libc::mkdirat(parent_file.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("mkdirat SQLite data directory");
-        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: held parent fd, final name and stat pointer are valid.
+        let stat_result = unsafe {
+            libc::fstatat(
+                parent_file.as_raw_fd(),
+                name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let created = if stat_result == 0 {
+            // SAFETY: fstatat succeeded.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                anyhow::bail!("SQLite data directory final component is not a directory");
+            }
+            false
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("inspect SQLite data directory final component");
+            }
+            // SAFETY: parent fd and final-component name are valid.
+            if unsafe { libc::mkdirat(parent_file.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("mkdirat SQLite data directory");
+            }
+            true
+        };
         // SAFETY: parent fd and final-component name are valid; no symlink following.
         let dir_fd = unsafe {
             libc::openat(
@@ -178,14 +197,19 @@ impl ProcessLock {
         }
         // SAFETY: dir_fd is newly owned.
         let dir = unsafe { File::from_raw_fd(dir_fd) };
-        // SAFETY: dir fd is valid; explicit mode is independent of umask.
-        if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("fchmod SQLite data directory");
+        if created {
+            // SAFETY: dir fd is valid; explicit mode is independent of umask.
+            if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("fchmod SQLite data directory");
+            }
         }
         Self::validate_private_directory(&dir, "SQLite data directory")?;
-        parent_file
-            .sync_all()
-            .context("fsync SQLite data directory parent")?;
+        if created {
+            parent_file
+                .sync_all()
+                .context("fsync SQLite data directory parent")?;
+        }
         Ok(dir)
     }
 
@@ -233,30 +257,10 @@ impl ProcessLock {
     }
 
     #[cfg(unix)]
-    fn acquire_unix(data_dir: &Path, opened_dir: Option<File>) -> anyhow::Result<Self> {
+    fn acquire_unix(data_dir: &Path) -> anyhow::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::ffi::OsStrExt;
 
-        let dir = match opened_dir {
-            Some(dir) => dir,
-            None => {
-                let path = std::ffi::CString::new(data_dir.as_os_str().as_bytes())?;
-                // SAFETY: path is NUL-terminated; returned fd is owned below.
-                let dir_fd = unsafe {
-                    libc::open(
-                        path.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if dir_fd < 0 {
-                    return Err(std::io::Error::last_os_error())
-                        .context("open SQLite data directory");
-                }
-                // SAFETY: dir_fd is newly owned by this call.
-                unsafe { File::from_raw_fd(dir_fd) }
-            }
-        };
-        Self::validate_private_directory(&dir, "SQLite data directory")?;
+        let dir = Self::open_or_create_data_dir_unix(data_dir)?;
         let lock_name = c"assay-engine.lock";
         // SAFETY: directory fd and constant relative name are valid.
         let lock_fd = unsafe {
@@ -319,6 +323,7 @@ mod tests {
     #[test]
     fn anchored_directory_survives_path_replacement() {
         let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let data = temp.path().join("data");
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -339,6 +344,7 @@ mod tests {
     #[test]
     fn public_or_symlinked_data_directory_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let public = temp.path().join("public");
         std::fs::create_dir(&public).unwrap();
         std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
