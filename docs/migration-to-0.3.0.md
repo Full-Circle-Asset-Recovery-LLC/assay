@@ -221,11 +221,18 @@ assay-engine vault init-shamir \
 ```
 
 The command validates and hashes the manifest, pinned binary, complete checkpointed SQLite
-generation, and output directory while holding the process lock. It writes a non-secret transition
-audit receipt containing the manifest digest, generation, binary digest, database digests, bundle
-digest, operator UID, and outcome in the same transaction as the KEK change. The five-share bundle
-is written once with mode `0600`; distribute shares to separate custodians and remove the aggregate
-bundle after distribution.
+generation, and output directory while holding the process lock. The backup hashes always describe
+the pre-migration generation. After validation, the command idempotently migrates the vault schema;
+this covers v0.5.15 databases whose disabled vault runtime never added `kek_digest`. It then writes a
+non-secret transition audit receipt containing the manifest digest, generation, binary digest,
+database digests, bundle digest, operator UID, whether schema migration was required, and outcome in
+the same transaction as the KEK change. The five-share bundle is written once with mode `0600`;
+distribute shares to separate custodians and remove the aggregate bundle after distribution.
+
+If schema migration fails, the command publishes no bundle or recovery journal. The database stays
+either in the exact legacy state or in an idempotently migrated plaintext state; rerun the same
+command only after correcting the migration error. The paired rollback manifest remains valid for
+restoring the original pre-migration generation.
 
 Recovery states:
 

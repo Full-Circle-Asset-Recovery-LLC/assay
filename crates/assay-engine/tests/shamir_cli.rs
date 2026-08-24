@@ -289,6 +289,186 @@ async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, sqlx::SqlitePool) 
     (tmp, config, pool)
 }
 
+async fn legacy_v0515_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = data_dir.join("engine.db");
+    let vault = data_dir.join("vault.db");
+    let engine_for_attach = engine.clone();
+    let vault_for_attach = vault.clone();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let engine = engine_for_attach.clone();
+            let vault = vault_for_attach.clone();
+            Box::pin(async move {
+                connection
+                    .execute(format!("ATTACH DATABASE '{}' AS engine", engine.display()).as_str())
+                    .await?;
+                connection
+                    .execute(format!("ATTACH DATABASE '{}' AS vault", vault.display()).as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(":memory:")
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE engine.instances (
+            id TEXT PRIMARY KEY,
+            started_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            last_heartbeat REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            namespaces TEXT NOT NULL DEFAULT '[]',
+            version TEXT
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE engine.migrations (
+            module TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            applied_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            PRIMARY KEY(module, version)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE vault.kek_metadata (
+            kid TEXT PRIMARY KEY,
+            sealing_method TEXT NOT NULL,
+            sealed INTEGER NOT NULL DEFAULT 1,
+            sealed_blob BLOB NOT NULL DEFAULT x'',
+            share_threshold INTEGER,
+            share_count INTEGER,
+            sealed_at REAL,
+            unsealed_at REAL,
+            created_at REAL NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = [7u8; 32];
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"assay-vault/kek-kid/v1");
+    hasher.update(key);
+    let digest = hasher.finalize();
+    let kid = format!(
+        "kek-{}",
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    sqlx::query(
+        "INSERT INTO vault.kek_metadata
+            (kid,sealing_method,sealed,sealed_blob,created_at)
+         VALUES(?,'plaintext',0,?,1)",
+    )
+    .bind(kid)
+    .bind(key.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let config = data_dir.join("engine.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind_addr='127.0.0.1:0'\n[backend]\ntype='sqlite'\ndata_dir='{}'\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+    (tmp, config)
+}
+
+#[tokio::test]
+async fn legacy_v0515_plaintext_schema_migrates_then_transitions_to_shamir() {
+    let (_tmp, config) = legacy_v0515_fixture().await;
+    let out = config.parent().unwrap().join("legacy-shares.json");
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let verify = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(config.parent().unwrap().join("vault.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let row: (String, Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT sealing_method, sealed_blob, kek_digest FROM kek_metadata")
+            .fetch_one(&verify)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "shamir");
+    assert!(row.1.is_empty());
+    assert_eq!(row.2.len(), 32);
+    let schema_migrated: i64 =
+        sqlx::query_scalar("SELECT schema_migrated FROM sealing_transition_audit")
+            .fetch_one(&verify)
+            .await
+            .unwrap();
+    assert_eq!(schema_migrated, 1);
+    let repeated = authorized_command(&config, &out).output().unwrap();
+    assert!(!repeated.status.success());
+}
+
+#[tokio::test]
+async fn injected_schema_migration_failure_publishes_nothing_and_leaves_valid_plaintext() {
+    let (_tmp, config) = legacy_v0515_fixture().await;
+    let out = config.parent().unwrap().join("legacy-failure.json");
+    let result = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_FAIL_POINT", "after-schema-migration")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!out.exists());
+    assert!(!journal_path(&out).exists());
+    let verify = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(config.parent().unwrap().join("vault.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let row: (String, Vec<u8>) =
+        sqlx::query_as("SELECT sealing_method, sealed_blob FROM kek_metadata")
+            .fetch_one(&verify)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "plaintext");
+    assert_eq!(row.1, vec![7u8; 32]);
+    let has_digest: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('kek_metadata') WHERE name='kek_digest'",
+    )
+    .fetch_one(&verify)
+    .await
+    .unwrap();
+    assert_eq!(has_digest, 1, "valid migrated plaintext state is allowed");
+}
+
 #[tokio::test]
 async fn offline_init_requires_operator_identity_and_backup_manifest() {
     let (_tmp, config, pool) = fixture().await;

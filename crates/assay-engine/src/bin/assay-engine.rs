@@ -80,6 +80,7 @@ struct TransitionJournal {
     bundle_digest: String,
     share_threshold: u8,
     share_count: u8,
+    schema_migrated: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -98,6 +99,7 @@ struct TransitionAuditRow {
     share_count: i64,
     plaintext_backup_acknowledged: i64,
     outcome: String,
+    schema_migrated: i64,
 }
 
 #[cfg(unix)]
@@ -523,6 +525,19 @@ async fn offline_init_shamir(
         .connect_with(opts)
         .await
         .context("open isolated SQLite vault")?;
+    let had_kek_digest: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vault.pragma_table_info('kek_metadata') WHERE name='kek_digest'",
+    )
+    .fetch_one(&pool)
+    .await
+    .context("inspect legacy vault KEK schema")?;
+    assay_vault::schema::migrate_sqlite(&pool)
+        .await
+        .context("migrate vault schema for offline Shamir transition")?;
+    let schema_migrated = had_kek_digest == 0;
+    if injected_failure.as_deref() == Some("after-schema-migration") {
+        anyhow::bail!("injected failure after schema migration");
+    }
     let mut conn = pool.acquire().await?;
     if let Some(mut journal) = recovery_journal {
         validate_recovery_journal_identity(
@@ -705,6 +720,7 @@ async fn offline_init_shamir(
         bundle_digest: bundle_digest.clone(),
         share_threshold: threshold,
         share_count: shares_count,
+        schema_migrated,
     };
     let mut created_output = false;
     let file_result = (|| -> anyhow::Result<()> {
@@ -752,6 +768,7 @@ async fn offline_init_shamir(
             share_threshold INTEGER NOT NULL,
             share_count INTEGER NOT NULL,
             plaintext_backup_acknowledged INTEGER NOT NULL,
+            schema_migrated INTEGER NOT NULL,
             outcome TEXT NOT NULL,
             created_at REAL NOT NULL
         )",
@@ -764,8 +781,8 @@ async fn offline_init_shamir(
             (transition_id, old_kid, new_kid, old_method, new_method, operator_id,
              backup_ref, manifest_digest, backup_generation, baseline_binary_digest,
              database_artifact_digests, bundle_digest, share_threshold, share_count,
-             plaintext_backup_acknowledged, outcome, created_at)
-         VALUES (?, ?, ?, 'plaintext', 'shamir', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?)",
+             plaintext_backup_acknowledged, schema_migrated, outcome, created_at)
+         VALUES (?, ?, ?, 'plaintext', 'shamir', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'committed', ?)",
     )
     .bind(&transition_id)
     .bind(&journal.old_kid)
@@ -779,6 +796,7 @@ async fn offline_init_shamir(
     .bind(&bundle_digest)
     .bind(i64::from(threshold))
     .bind(i64::from(shares_count))
+    .bind(i64::from(schema_migrated))
     .bind(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -815,6 +833,7 @@ async fn validate_transition_audit_receipt(
                 manifest_digest, backup_generation, baseline_binary_digest,
                 database_artifact_digests, bundle_digest, share_threshold,
                 share_count, plaintext_backup_acknowledged, outcome
+                , schema_migrated
            FROM vault.sealing_transition_audit
           WHERE transition_id=?",
     )
@@ -836,6 +855,7 @@ async fn validate_transition_audit_receipt(
         || row.share_count != i64::from(journal.share_count)
         || row.plaintext_backup_acknowledged != 1
         || row.outcome != "committed"
+        || row.schema_migrated != i64::from(journal.schema_migrated)
     {
         anyhow::bail!("transition audit receipt mismatch; paired rollback is required");
     }

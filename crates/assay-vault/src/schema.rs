@@ -281,6 +281,7 @@ CREATE TABLE IF NOT EXISTS vault.sealing_transition_audit (
     share_threshold INTEGER NOT NULL,
     share_count     INTEGER NOT NULL,
     plaintext_backup_acknowledged BOOLEAN NOT NULL,
+    schema_migrated BOOLEAN NOT NULL,
     outcome         TEXT NOT NULL,
     created_at      DOUBLE PRECISION NOT NULL
 );
@@ -536,6 +537,7 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
             share_threshold INTEGER NOT NULL,
             share_count     INTEGER NOT NULL,
             plaintext_backup_acknowledged INTEGER NOT NULL,
+            schema_migrated INTEGER NOT NULL,
             outcome         TEXT NOT NULL,
             created_at      REAL NOT NULL
         )",
@@ -578,6 +580,13 @@ pub async fn migrate_postgres(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .await
         .context("vault pg migrate: add kek_digest")?;
     sqlx::query(
+        "ALTER TABLE vault.sealing_transition_audit
+         ADD COLUMN IF NOT EXISTS schema_migrated BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    .execute(pool)
+    .await
+    .context("vault pg migrate: add schema_migrated receipt")?;
+    sqlx::query(
         "INSERT INTO engine.migrations (module, version) VALUES ($1, $2) \
          ON CONFLICT DO NOTHING",
     )
@@ -616,6 +625,24 @@ pub async fn migrate_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await
             .context("vault sqlite migrate: add kek_digest")?;
+    }
+    let has_schema_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('sealing_transition_audit')
+            WHERE name = 'schema_migrated'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect vault.sealing_transition_audit columns")?;
+    if !has_schema_migrated {
+        sqlx::query(
+            "ALTER TABLE vault.sealing_transition_audit
+             ADD COLUMN schema_migrated INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .context("vault sqlite migrate: add schema_migrated receipt")?;
     }
     sqlx::query("INSERT OR IGNORE INTO engine.migrations (module, version) VALUES (?, ?)")
         .bind(MODULE_NAME)
