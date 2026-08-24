@@ -3,6 +3,57 @@ use std::path::Path;
 
 use anyhow::Context;
 
+pub struct RuntimeAuthority {
+    process_lock: std::sync::Arc<ProcessLock>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+pub struct RuntimeTaskGuard {
+    _process_lock: std::sync::Arc<ProcessLock>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+}
+
+impl RuntimeAuthority {
+    pub fn new(process_lock: ProcessLock) -> std::sync::Arc<Self> {
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        std::sync::Arc::new(Self {
+            process_lock: std::sync::Arc::new(process_lock),
+            cancel,
+        })
+    }
+
+    pub fn anchored_data_dir(&self) -> Option<std::path::PathBuf> {
+        self.process_lock.anchored_data_dir()
+    }
+
+    pub fn task_guard(&self) -> RuntimeTaskGuard {
+        RuntimeTaskGuard {
+            _process_lock: std::sync::Arc::clone(&self.process_lock),
+            cancel: self.cancel.subscribe(),
+        }
+    }
+
+    pub fn lock_guard(&self) -> std::sync::Arc<dyn Send + Sync> {
+        std::sync::Arc::clone(&self.process_lock) as std::sync::Arc<dyn Send + Sync>
+    }
+}
+
+impl Drop for RuntimeAuthority {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+impl RuntimeTaskGuard {
+    pub async fn cancelled(&mut self) {
+        while !*self.cancel.borrow() {
+            if self.cancel.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 pub struct ProcessLock {
     _file: File,
     #[cfg(unix)]
@@ -11,7 +62,28 @@ pub struct ProcessLock {
 
 impl ProcessLock {
     pub fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(data_dir).context("create SQLite data directory for lock")?;
+        let existed = match std::fs::symlink_metadata(data_dir) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).context("inspect SQLite data directory for lock"),
+        };
+        if !existed {
+            std::fs::create_dir_all(data_dir).context("create SQLite data directory for lock")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+                    .context("set private SQLite data directory mode")?;
+                let parent = data_dir
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                File::open(parent)
+                    .context("open SQLite data directory parent")?
+                    .sync_all()
+                    .context("fsync SQLite data directory parent")?;
+            }
+        }
         #[cfg(unix)]
         {
             Self::acquire_unix(data_dir)
@@ -160,5 +232,29 @@ mod tests {
         let link = temp.path().join("link");
         symlink(&private, &link).unwrap();
         assert!(ProcessLock::acquire(&link).is_err());
+    }
+
+    #[test]
+    fn missing_data_directory_is_created_mode_0700_under_permissive_umask() {
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                // SAFETY: restoring this process's prior umask.
+                unsafe { libc::umask(self.0) };
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("missing-data");
+        // SAFETY: test deliberately controls and restores the process umask.
+        let old = unsafe { libc::umask(0o002) };
+        let guard = UmaskGuard(old);
+        let lock = ProcessLock::acquire(&data).unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(lock);
     }
 }

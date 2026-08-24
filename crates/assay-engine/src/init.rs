@@ -130,7 +130,10 @@ pub struct SqliteBoot {
 
 impl EngineBoot {
     /// Run the boot sequence end-to-end against the configured backend.
-    pub async fn run(cfg: &EngineConfig) -> anyhow::Result<Self> {
+    pub async fn run(
+        cfg: &EngineConfig,
+        runtime_authority: Option<&Arc<crate::process_lock::RuntimeAuthority>>,
+    ) -> anyhow::Result<Self> {
         match cfg.backend.clone() {
             #[cfg(feature = "backend-postgres")]
             BackendConfig::Postgres { url } => {
@@ -143,7 +146,8 @@ impl EngineBoot {
                     .backend
                     .sqlite_data_dir()
                     .expect("sqlite backend yields data_dir");
-                let boot = sqlite_boot(&data_dir, &cfg.auto_enable_modules).await?;
+                let boot =
+                    sqlite_boot(&data_dir, &cfg.auto_enable_modules, runtime_authority).await?;
                 Ok(EngineBoot::Sqlite(boot))
             }
             #[allow(unreachable_patterns)]
@@ -336,7 +340,11 @@ fn spawn_pg_instance_lifecycle(pool: sqlx::PgPool, id: uuid::Uuid) {
 }
 
 #[cfg(feature = "backend-sqlite")]
-async fn sqlite_boot(data_dir: &str, auto_enable: &[String]) -> anyhow::Result<SqliteBoot> {
+async fn sqlite_boot(
+    data_dir: &str,
+    auto_enable: &[String],
+    runtime_authority: Option<&Arc<crate::process_lock::RuntimeAuthority>>,
+) -> anyhow::Result<SqliteBoot> {
     use assay_domain::engine::SqliteEngineSchema;
     use assay_domain::events::SqliteEngineEventBus;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -442,7 +450,11 @@ async fn sqlite_boot(data_dir: &str, auto_enable: &[String]) -> anyhow::Result<S
         .register_instance(&modules, Some(env!("CARGO_PKG_VERSION")))
         .await
         .map_err(|e| anyhow::anyhow!("register engine.instances row: {e}"))?;
-    spawn_sqlite_instance_lifecycle(pool.clone(), instance_id);
+    spawn_sqlite_instance_lifecycle(
+        pool.clone(),
+        instance_id,
+        runtime_authority.map(|authority| authority.task_guard()),
+    );
 
     info!(target: "assay-engine", instance = %instance_id, modules = ?modules, "boot complete (sqlite)");
     Ok(SqliteBoot {
@@ -529,13 +541,25 @@ async fn record_engine_migration_sqlite(
 }
 
 #[cfg(feature = "backend-sqlite")]
-fn spawn_sqlite_instance_lifecycle(pool: sqlx::SqlitePool, id: uuid::Uuid) {
+fn spawn_sqlite_instance_lifecycle(
+    pool: sqlx::SqlitePool,
+    id: uuid::Uuid,
+    runtime_guard: Option<crate::process_lock::RuntimeTaskGuard>,
+) {
     use assay_domain::engine::SqliteEngineSchema;
     let schema = SqliteEngineSchema::new(pool);
     tokio::spawn(async move {
+        let mut runtime_guard = runtime_guard;
         let mut tick = tokio::time::interval(Duration::from_secs(INSTANCE_HEARTBEAT_SECS));
         loop {
-            tick.tick().await;
+            if let Some(guard) = runtime_guard.as_mut() {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = guard.cancelled() => break,
+                }
+            } else {
+                tick.tick().await;
+            }
             if let Err(e) = schema.heartbeat_instance(id).await {
                 tracing::warn!(?e, %id, "engine.instances heartbeat failed");
             }
@@ -553,7 +577,7 @@ mod tests {
     /// first boot now.
     #[tokio::test(flavor = "multi_thread")]
     async fn sqlite_boot_default_runs_auth_migration() {
-        let boot = sqlite_boot(":memory:", &[]).await.expect("boot");
+        let boot = sqlite_boot(":memory:", &[], None).await.expect("boot");
         assert!(
             boot.modules.iter().any(|m| m == "auth"),
             "auth must be in active modules by default; got {:?}",

@@ -81,7 +81,7 @@ pub struct EmbeddedEngine {
 
     /// Held for the full lifetime of every persistent SQLite engine so
     /// embedded and standalone users contend with offline administration.
-    _process_lock: Option<crate::process_lock::ProcessLock>,
+    _runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
 }
 
 /// Backend-typed pool. Engine's internal code paths are backend-
@@ -116,25 +116,28 @@ pub enum EmbeddedPool {
 /// helpful operator-facing message when the cause is configuration.
 pub async fn build(mut cfg: EngineConfig) -> anyhow::Result<EmbeddedEngine> {
     let process_lock = process_lock_for_config(&cfg)?;
-    if let Some(anchored) = process_lock
+    let runtime_authority = process_lock.map(crate::process_lock::RuntimeAuthority::new);
+    if let Some(anchored) = runtime_authority
         .as_ref()
-        .and_then(crate::process_lock::ProcessLock::anchored_data_dir)
+        .and_then(|authority| authority.anchored_data_dir())
     {
         cfg.backend.anchor_sqlite_data_dir(&anchored);
     }
-    let boot = EngineBoot::run(&cfg).await?;
-    let mut engine = match boot {
+    let boot = EngineBoot::run(&cfg, runtime_authority.as_ref()).await?;
+    match boot {
         #[cfg(feature = "backend-postgres")]
-        EngineBoot::Postgres(b) => build_pg(cfg, b).await,
+        EngineBoot::Postgres(b) => build_pg(cfg, b, None).await,
         #[cfg(feature = "backend-sqlite")]
-        EngineBoot::Sqlite(b) => build_sqlite(cfg, b).await,
-    }?;
-    engine._process_lock = process_lock;
-    Ok(engine)
+        EngineBoot::Sqlite(b) => build_sqlite(cfg, b, runtime_authority).await,
+    }
 }
 
 #[cfg(feature = "backend-postgres")]
-async fn build_pg(cfg: EngineConfig, b: crate::init::PgBoot) -> anyhow::Result<EmbeddedEngine> {
+async fn build_pg(
+    cfg: EngineConfig,
+    b: crate::init::PgBoot,
+    runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
+) -> anyhow::Result<EmbeddedEngine> {
     let store = assay_workflow::PostgresStore::from_pool(b.pool.clone())
         .await
         .map_err(|e| anyhow::anyhow!("workflow store (pg): {e}"))?;
@@ -153,6 +156,7 @@ async fn build_pg(cfg: EngineConfig, b: crate::init::PgBoot) -> anyhow::Result<E
         Some(auth_ctx),
         vault_ctx,
         EmbeddedPool::Postgres(b.pool),
+        runtime_authority,
     )
     .await
 }
@@ -161,6 +165,7 @@ async fn build_pg(cfg: EngineConfig, b: crate::init::PgBoot) -> anyhow::Result<E
 async fn build_sqlite(
     cfg: EngineConfig,
     b: crate::init::SqliteBoot,
+    runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
 ) -> anyhow::Result<EmbeddedEngine> {
     let store = assay_workflow::SqliteStore::from_attached_pool(b.pool.clone())
         .await
@@ -180,6 +185,7 @@ async fn build_sqlite(
         Some(auth_ctx),
         vault_ctx,
         EmbeddedPool::Sqlite(b.pool),
+        runtime_authority,
     )
     .await
 }
@@ -208,6 +214,7 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
     #[cfg(feature = "vault")] vault_ctx: Option<assay_vault::VaultCtx>,
     #[cfg(not(feature = "vault"))] _vault_ctx: Option<()>,
     pool: EmbeddedPool,
+    runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
 ) -> anyhow::Result<EmbeddedEngine> {
     // Precondition: refuse to start when auth is on and no operator
     // user / api-key / external issuer is configured. Same logic as
@@ -236,17 +243,41 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
         }
     }
 
-    let workflow_ctx: Arc<WorkflowCtx<S>> =
-        crate::server::build_workflow_ctx_with_bus(store, Arc::clone(&bus));
+    let workflow_runtime_guard = runtime_authority
+        .as_ref()
+        .map(|authority| authority.lock_guard());
+    let workflow_ctx =
+        WorkflowCtx::start_with_runtime_guard(Arc::new(store), workflow_runtime_guard)
+            .with_binary_version(env!("CARGO_PKG_VERSION"))
+            .with_event_bus(assay_workflow::events::WorkflowEventBus::new(Arc::clone(
+                &bus,
+            )));
+    let workflow_ctx: Arc<WorkflowCtx<S>> = Arc::new(workflow_ctx);
 
     // Hourly sweep of the engine_events outbox. Detached — the handle
     // lives for the process lifetime; nothing to await for clean
     // shutdown (prune is idempotent, missed tick is fine).
-    tokio::spawn(assay_workflow::events_cleanup::run_events_cleanup(
-        Arc::clone(&bus),
-        std::time::Duration::from_secs(3600),
-        cfg.engine_events_ttl_secs,
-    ));
+    if let Some(authority) = runtime_authority.as_ref() {
+        let mut guard = authority.task_guard();
+        let cleanup_bus = Arc::clone(&bus);
+        let ttl = cfg.engine_events_ttl_secs;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = assay_workflow::events_cleanup::run_events_cleanup(
+                    cleanup_bus,
+                    std::time::Duration::from_secs(3600),
+                    ttl,
+                ) => {}
+                _ = guard.cancelled() => {}
+            }
+        });
+    } else {
+        tokio::spawn(assay_workflow::events_cleanup::run_events_cleanup(
+            Arc::clone(&bus),
+            std::time::Duration::from_secs(3600),
+            cfg.engine_events_ttl_secs,
+        ));
+    }
 
     let whitelabel = Arc::new(WhitelabelConfig::from_env());
     let asset_version = env!("CARGO_PKG_VERSION").to_string();
@@ -270,6 +301,7 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
         engine_version: env!("CARGO_PKG_VERSION"),
         started_at,
         engine_config,
+        runtime_authority: runtime_authority.clone(),
     };
 
     let router = crate::server::build_app(state);
@@ -280,7 +312,7 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
         instance_id,
         modules,
         engine_version: env!("CARGO_PKG_VERSION"),
-        _process_lock: None,
+        _runtime_authority: runtime_authority,
     })
 }
 
@@ -293,14 +325,15 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
 /// `EngineBoot::run(cfg).await?;` with a more discoverable name.
 pub async fn migrate(cfg: &EngineConfig) -> anyhow::Result<()> {
     let process_lock = process_lock_for_config(cfg)?;
+    let runtime_authority = process_lock.map(crate::process_lock::RuntimeAuthority::new);
     let mut anchored_cfg = cfg.clone();
-    if let Some(anchored) = process_lock
+    if let Some(anchored) = runtime_authority
         .as_ref()
-        .and_then(crate::process_lock::ProcessLock::anchored_data_dir)
+        .and_then(|authority| authority.anchored_data_dir())
     {
         anchored_cfg.backend.anchor_sqlite_data_dir(&anchored);
     }
-    let _boot = EngineBoot::run(&anchored_cfg).await?;
+    let _boot = EngineBoot::run(&anchored_cfg, runtime_authority.as_ref()).await?;
     Ok(())
 }
 

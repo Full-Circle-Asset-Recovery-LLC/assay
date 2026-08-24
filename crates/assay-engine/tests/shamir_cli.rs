@@ -1398,3 +1398,102 @@ async fn embedded_engine_holds_the_same_process_lock_as_offline_transition() {
     assert!(!out.exists());
     drop(embedded);
 }
+
+#[tokio::test]
+async fn cloned_router_retains_lock_until_last_authority_drops_and_tasks_quiesce() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let port = free_port();
+    configure_server(&config, port);
+    let cfg = assay_engine::EngineConfig::from_file(&config).unwrap();
+    let embedded = assay_engine::embedded::build(cfg).await.unwrap();
+    let router = embedded.router.clone();
+    drop(embedded);
+
+    let out = config.parent().unwrap().join("router-still-live.json");
+    let blocked = authorized_command(&config, &out).output().unwrap();
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("process holds"),
+        "stderr: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    drop(router);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let offline_lock = loop {
+        match assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()) {
+            Ok(lock) => break lock,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("background tasks did not quiesce and release lock: {error:#}"),
+        }
+    };
+    let engine_db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(config.parent().unwrap().join("engine.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let before: Option<f64> = sqlx::query_scalar("SELECT MAX(last_heartbeat) FROM instances")
+        .fetch_one(&engine_db)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let after: Option<f64> = sqlx::query_scalar("SELECT MAX(last_heartbeat) FROM instances")
+        .fetch_one(&engine_db)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "instance heartbeat wrote after authority release"
+    );
+    engine_db.close().await;
+    drop(offline_lock);
+}
+
+#[tokio::test]
+async fn engine_boot_creates_missing_data_dir_mode_0700_under_umask_0002() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data_dir = temp.path().join("new-data");
+    let config = temp.path().join("engine.toml");
+    let port = free_port();
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind_addr='127.0.0.1:{port}'\n[backend]\ntype='sqlite'\ndata_dir='{}'\n[auth]\nadmin_api_keys=['synthetic-test-key']\n[logging]\nlevel='error'\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_assay-engine"));
+    command
+        .args(["serve", "--config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec changes only the child process umask before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let client = direct_test_client();
+    wait_ready(&client, &mut child, port).await;
+    assert_eq!(
+        std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

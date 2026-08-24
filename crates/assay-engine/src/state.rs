@@ -63,6 +63,11 @@ pub struct EngineState<S: WorkflowStore> {
     /// shows the operator exactly what the running engine is using.
     /// `Arc` so cloning state per-request stays cheap.
     pub engine_config: Arc<EngineConfig>,
+    /// Shared SQLite runtime authority. The last router/state clone dropping
+    /// this value cancels guarded background tasks before the process lock
+    /// can become available to offline administration.
+    #[allow(dead_code)]
+    pub(crate) runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
 }
 
 impl<S: WorkflowStore> axum::extract::FromRef<EngineState<S>> for AuthCtx {
