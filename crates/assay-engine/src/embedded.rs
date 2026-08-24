@@ -61,8 +61,9 @@ pub struct EmbeddedEngine {
     ///     `/vault/console` — assay-dashboard SPAs
     pub router: axum::Router,
 
-    /// Backend-typed pool engine's modules use. Parent may share for
-    /// its own queries; engine confines writes to its own schemas
+    /// Backend-typed pool engine's modules use. SQLite callers receive
+    /// a guarded pool whose clones retain runtime lock authority.
+    /// Engine confines writes to its own schemas
     /// (`engine.*`, `workflow.*`, `auth.*`, `vault.*` on PG; per-
     /// module `.db` files on sqlite via ATTACH).
     pub pool: EmbeddedPool,
@@ -96,7 +97,58 @@ pub enum EmbeddedPool {
     #[cfg(feature = "backend-postgres")]
     Postgres(sqlx::PgPool),
     #[cfg(feature = "backend-sqlite")]
-    Sqlite(sqlx::SqlitePool),
+    Sqlite(GuardedSqlitePool),
+}
+
+#[cfg(feature = "backend-sqlite")]
+#[derive(Clone)]
+pub struct GuardedSqlitePool {
+    pool: sqlx::SqlitePool,
+    runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
+}
+
+#[cfg(feature = "backend-sqlite")]
+impl GuardedSqlitePool {
+    fn new(
+        pool: sqlx::SqlitePool,
+        runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
+    ) -> Self {
+        Self {
+            pool,
+            runtime_authority,
+        }
+    }
+
+    /// Acquire a connection that independently retains the runtime lock.
+    pub async fn acquire(&self) -> Result<GuardedSqliteConnection, sqlx::Error> {
+        Ok(GuardedSqliteConnection {
+            connection: self.pool.acquire().await?,
+            runtime_authority: self.runtime_authority.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "backend-sqlite")]
+pub struct GuardedSqliteConnection {
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    #[allow(dead_code)]
+    runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
+}
+
+#[cfg(feature = "backend-sqlite")]
+impl std::ops::Deref for GuardedSqliteConnection {
+    type Target = sqlx::SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+#[cfg(feature = "backend-sqlite")]
+impl std::ops::DerefMut for GuardedSqliteConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
 /// Build engine for embedding. Internally:
@@ -184,7 +236,7 @@ async fn build_sqlite(
         b.instance_id,
         Some(auth_ctx),
         vault_ctx,
-        EmbeddedPool::Sqlite(b.pool),
+        EmbeddedPool::Sqlite(GuardedSqlitePool::new(b.pool, runtime_authority.clone())),
         runtime_authority,
     )
     .await
@@ -210,12 +262,18 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
     bus: Arc<dyn EngineEventBus>,
     modules: Vec<String>,
     instance_id: uuid::Uuid,
-    auth_ctx: Option<assay_auth::AuthCtx>,
+    mut auth_ctx: Option<assay_auth::AuthCtx>,
     #[cfg(feature = "vault")] vault_ctx: Option<assay_vault::VaultCtx>,
     #[cfg(not(feature = "vault"))] _vault_ctx: Option<()>,
     pool: EmbeddedPool,
     runtime_authority: Option<Arc<crate::process_lock::RuntimeAuthority>>,
 ) -> anyhow::Result<EmbeddedEngine> {
+    #[cfg(feature = "auth-recovery")]
+    if let Some(authority) = runtime_authority.as_ref()
+        && let Some(auth) = auth_ctx.take()
+    {
+        auth_ctx = Some(auth.with_recovery_runtime_guard(authority.lock_guard()));
+    }
     // Precondition: refuse to start when auth is on and no operator
     // user / api-key / external issuer is configured. Same logic as
     // the previous run_with_store, lifted unchanged.

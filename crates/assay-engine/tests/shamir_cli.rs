@@ -1457,6 +1457,130 @@ async fn cloned_router_retains_lock_until_last_authority_drops_and_tasks_quiesce
 }
 
 #[tokio::test]
+async fn cloned_embedded_sqlite_pool_retains_runtime_authority_until_drop() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let port = free_port();
+    configure_server(&config, port);
+    let cfg = assay_engine::EngineConfig::from_file(&config).unwrap();
+    let embedded = assay_engine::embedded::build(cfg).await.unwrap();
+    let guarded_pool = match &embedded.pool {
+        assay_engine::embedded::EmbeddedPool::Sqlite(pool) => pool.clone(),
+        _ => panic!("expected SQLite embedded pool"),
+    };
+    let router = embedded.router.clone();
+    drop(embedded);
+    drop(router);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()).is_err());
+    let mut connection = guarded_pool.acquire().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine.modules")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert!(count >= 2);
+    drop(connection);
+    drop(guarded_pool);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()) {
+            Ok(lock) => {
+                drop(lock);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("guarded pool did not release runtime authority: {error:#}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn detached_auth_recovery_task_retains_lock_until_request_quiesces() {
+    use tower::ServiceExt as _;
+
+    struct RecoveryEnvGuard;
+    impl Drop for RecoveryEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: test removes its unique process-local coordination variables.
+            unsafe {
+                std::env::remove_var("ASSAY_TEST_RECOVERY_TASK_READY");
+                std::env::remove_var("ASSAY_TEST_RECOVERY_TASK_RESUME");
+            }
+        }
+    }
+
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let port = free_port();
+    configure_server(&config, port);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[auth.recovery]\nenabled=true\n\
+         [auth.recovery.smtp]\nhost='127.0.0.1'\nport=1\nusername=''\npassword=''\nfrom='test@example.com'\nstarttls=false\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let ready = config.parent().unwrap().join("recovery-ready");
+    let resume = config.parent().unwrap().join("recovery-resume");
+    // SAFETY: unique test coordination paths are removed by RecoveryEnvGuard.
+    unsafe {
+        std::env::set_var("ASSAY_TEST_RECOVERY_TASK_READY", &ready);
+        std::env::set_var("ASSAY_TEST_RECOVERY_TASK_RESUME", &resume);
+    }
+    let env_guard = RecoveryEnvGuard;
+    let cfg = assay_engine::EngineConfig::from_file(&config).unwrap();
+    let embedded = assay_engine::embedded::build(cfg).await.unwrap();
+    let router = embedded.router.clone();
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/v1/engine/auth/password/recovery/request")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"email":"nobody@example.com"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        ready.exists(),
+        "recovery task did not reach detached boundary"
+    );
+    drop(response);
+    drop(router);
+    drop(embedded);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()).is_err());
+
+    std::fs::write(&resume, b"continue").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let offline_lock = loop {
+        match assay_engine::process_lock::ProcessLock::acquire(config.parent().unwrap()) {
+            Ok(lock) => break lock,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("recovery task did not quiesce: {error:#}"),
+        }
+    };
+    let before = std::fs::read(config.parent().unwrap().join("auth.db")).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("auth.db")).unwrap(),
+        before
+    );
+    drop(offline_lock);
+    drop(env_guard);
+}
+
+#[tokio::test]
 async fn engine_boot_creates_missing_data_dir_mode_0700_under_umask_0002() {
     use std::os::unix::process::CommandExt as _;
 

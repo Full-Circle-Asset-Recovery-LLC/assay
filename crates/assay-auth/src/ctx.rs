@@ -131,6 +131,14 @@ impl AuthCtx {
         self
     }
 
+    #[cfg(feature = "auth-recovery")]
+    pub fn with_recovery_runtime_guard(mut self, runtime_guard: Arc<dyn Send + Sync>) -> Self {
+        if let Some(recovery) = self.recovery.take() {
+            self.recovery = Some(recovery.with_runtime_guard(runtime_guard));
+        }
+        self
+    }
+
     /// Replace the JWT configuration. Used by engine boot once the
     /// JWKS keys have been loaded from `auth.jwks_keys`.
     #[cfg(feature = "auth-jwt")]
