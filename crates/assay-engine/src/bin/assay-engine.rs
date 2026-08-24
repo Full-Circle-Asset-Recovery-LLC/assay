@@ -61,6 +61,7 @@ struct PreparedShares {
     kid: String,
     shares: zeroize::Zeroizing<Vec<Vec<u8>>>,
     old_kid: String,
+    schema_migrated: bool,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -80,6 +81,7 @@ struct TransitionJournal {
     bundle_digest: String,
     share_threshold: u8,
     share_count: u8,
+    #[serde(default)]
     schema_migrated: bool,
 }
 
@@ -525,19 +527,6 @@ async fn offline_init_shamir(
         .connect_with(opts)
         .await
         .context("open isolated SQLite vault")?;
-    let had_kek_digest: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM vault.pragma_table_info('kek_metadata') WHERE name='kek_digest'",
-    )
-    .fetch_one(&pool)
-    .await
-    .context("inspect legacy vault KEK schema")?;
-    assay_vault::schema::migrate_sqlite(&pool)
-        .await
-        .context("migrate vault schema for offline Shamir transition")?;
-    let schema_migrated = had_kek_digest == 0;
-    if injected_failure.as_deref() == Some("after-schema-migration") {
-        anyhow::bail!("injected failure after schema migration");
-    }
     let mut conn = pool.acquire().await?;
     if let Some(mut journal) = recovery_journal {
         validate_recovery_journal_identity(
@@ -597,6 +586,12 @@ async fn offline_init_shamir(
         .context("acquire exclusive SQLite vault transaction")?;
 
     let result: anyhow::Result<PreparedShares> = async {
+        let schema_migrated = migrate_vault_schema_in_transaction(&mut conn).await?;
+        if injected_failure.as_deref() == Some("after-schema-migration") {
+            anyhow::bail!("injected failure after schema migration");
+        }
+        #[cfg(debug_assertions)]
+        maybe_sigkill("after-schema-ddl-pretransition");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -667,6 +662,7 @@ async fn offline_init_shamir(
             kid,
             shares: bytes,
             old_kid,
+            schema_migrated,
         })
     }
     .await;
@@ -675,6 +671,7 @@ async fn offline_init_shamir(
         kid,
         shares: share_bytes,
         old_kid,
+        schema_migrated,
     } = match result {
         Ok(value) => value,
         Err(e) => {
@@ -860,6 +857,69 @@ async fn validate_transition_audit_receipt(
         anyhow::bail!("transition audit receipt mismatch; paired rollback is required");
     }
     Ok(())
+}
+
+async fn migrate_vault_schema_in_transaction(
+    conn: &mut sqlx::SqliteConnection,
+) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+
+    let had_kek_digest: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('kek_metadata')
+            WHERE name='kek_digest'
+        )",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("inspect legacy vault KEK schema")?;
+    let had_schema_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('sealing_transition_audit')
+            WHERE name='schema_migrated'
+        )",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("inspect legacy vault transition audit schema")?;
+
+    for (label, statement) in assay_vault::schema::SQLITE_DDL_V1 {
+        sqlx::query(statement)
+            .execute(&mut *conn)
+            .await
+            .with_context(|| format!("vault offline sqlite migrate: {label}"))?;
+    }
+    if !had_kek_digest {
+        sqlx::query("ALTER TABLE vault.kek_metadata ADD COLUMN kek_digest BLOB")
+            .execute(&mut *conn)
+            .await
+            .context("vault offline sqlite migrate: add kek_digest")?;
+    }
+    let has_schema_migrated_now: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('sealing_transition_audit')
+            WHERE name='schema_migrated'
+        )",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("inspect migrated vault transition audit schema")?;
+    if !has_schema_migrated_now {
+        sqlx::query(
+            "ALTER TABLE vault.sealing_transition_audit
+             ADD COLUMN schema_migrated INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&mut *conn)
+        .await
+        .context("vault offline sqlite migrate: add schema_migrated receipt")?;
+    }
+    sqlx::query("INSERT OR IGNORE INTO engine.migrations (module, version) VALUES (?, ?)")
+        .bind(assay_vault::schema::MODULE_NAME)
+        .bind(assay_vault::schema::MIGRATION_VERSION)
+        .execute(&mut *conn)
+        .await
+        .context("record offline vault schema migration")?;
+    Ok(!had_kek_digest || !had_schema_migrated)
 }
 
 fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow::Result<()> {

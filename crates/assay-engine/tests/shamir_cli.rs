@@ -396,6 +396,121 @@ async fn legacy_v0515_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, config)
 }
 
+async fn checkpoint_delete_mode(path: &std::path::Path) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let _: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode=DELETE")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn actual_baseline_v0515_child_creates_legacy_schema_then_candidate_transitions() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data_dir = temp.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = temp.path().join("engine.toml");
+    let port = free_port();
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind_addr='127.0.0.1:{port}'\n[backend]\ntype='sqlite'\ndata_dir='{}'\n[auth]\nadmin_api_keys=['synthetic-test-key']\n[logging]\nlevel='error'\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+    let baseline = std::path::PathBuf::from(
+        std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
+            .expect("ASSAY_TEST_BASELINE_BINARY must be provided"),
+    );
+    assert_eq!(sha256(&baseline), BASELINE_V0515_SHA256);
+    let mut child = spawn_binary(&baseline, &config);
+    let client = direct_test_client();
+    wait_ready(&client, &mut child, port).await;
+    let vault_status = client
+        .get(format!(
+            "http://127.0.0.1:{port}/api/v1/vault/sys/seal-status"
+        ))
+        .bearer_auth("synthetic-test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vault_status.status(), 200, "baseline vault must be enabled");
+    // SAFETY: terminate only the test-owned baseline child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    child.wait().unwrap();
+
+    for name in ["engine.db", "workflow.db", "auth.db", "vault.db"] {
+        checkpoint_delete_mode(&data_dir.join(name)).await;
+    }
+    let engine = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(data_dir.join("engine.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM instances")
+        .execute(&engine)
+        .await
+        .unwrap();
+    engine.close().await;
+    let vault = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(data_dir.join("vault.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let has_digest: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('kek_metadata') WHERE name='kek_digest'",
+    )
+    .fetch_one(&vault)
+    .await
+    .unwrap();
+    assert_eq!(
+        has_digest, 0,
+        "baseline must reproduce the legacy precondition"
+    );
+    vault.close().await;
+
+    let candidate_config = data_dir.join("candidate.toml");
+    std::fs::copy(&config, &candidate_config).unwrap();
+    let out = data_dir.join("baseline-child-shares.json");
+    let result = authorized_command(&candidate_config, &out)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let repeated = authorized_command(&candidate_config, &out)
+        .output()
+        .unwrap();
+    assert!(!repeated.status.success());
+}
+
 #[tokio::test]
 async fn legacy_v0515_plaintext_schema_migrates_then_transitions_to_shamir() {
     let (_tmp, config) = legacy_v0515_fixture().await;
@@ -437,6 +552,9 @@ async fn legacy_v0515_plaintext_schema_migrates_then_transitions_to_shamir() {
 async fn injected_schema_migration_failure_publishes_nothing_and_leaves_valid_plaintext() {
     let (_tmp, config) = legacy_v0515_fixture().await;
     let out = config.parent().unwrap().join("legacy-failure.json");
+    let _manifest = write_backup_manifest(&config);
+    let before_engine = std::fs::read(config.parent().unwrap().join("engine.db")).unwrap();
+    let before_vault = std::fs::read(config.parent().unwrap().join("vault.db")).unwrap();
     let result = authorized_command(&config, &out)
         .env("ASSAY_TEST_SHAMIR_FAIL_POINT", "after-schema-migration")
         .output()
@@ -466,7 +584,58 @@ async fn injected_schema_migration_failure_publishes_nothing_and_leaves_valid_pl
     .fetch_one(&verify)
     .await
     .unwrap();
-    assert_eq!(has_digest, 1, "valid migrated plaintext state is allowed");
+    assert_eq!(
+        has_digest, 0,
+        "legacy DDL must roll back with the transition"
+    );
+    verify.close().await;
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("engine.db")).unwrap(),
+        before_engine
+    );
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("vault.db")).unwrap(),
+        before_vault
+    );
+    let retry = authorized_command(&config, &out).output().unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sigkill_after_legacy_ddl_rolls_back_and_original_manifest_retries_successfully() {
+    let (_tmp, config) = legacy_v0515_fixture().await;
+    let out = config.parent().unwrap().join("legacy-sigkill.json");
+    let _manifest = write_backup_manifest(&config);
+    let before_engine = std::fs::read(config.parent().unwrap().join("engine.db")).unwrap();
+    let before_vault = std::fs::read(config.parent().unwrap().join("vault.db")).unwrap();
+    let killed = authorized_command(&config, &out)
+        .env(
+            "ASSAY_TEST_SHAMIR_KILL_POINT",
+            "after-schema-ddl-pretransition",
+        )
+        .output()
+        .unwrap();
+    assert!(!killed.status.success());
+    assert!(!out.exists());
+    assert!(!journal_path(&out).exists());
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("engine.db")).unwrap(),
+        before_engine
+    );
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("vault.db")).unwrap(),
+        before_vault
+    );
+    let retry = authorized_command(&config, &out).output().unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
 }
 
 #[tokio::test]
@@ -929,6 +1098,34 @@ async fn postcommit_prejournal_sigkill_recovers_only_with_intact_private_bundle(
     assert_eq!(journal["phase"], "prepared");
     let recovered = authorized_command(&config, &out).output().unwrap();
     assert!(recovered.status.success());
+}
+
+#[tokio::test]
+async fn recovery_accepts_pre_schema_migrated_prepared_and_committed_journals() {
+    for point in ["db-committed-prejournal", "postcommit"] {
+        let (_tmp, config, pool) = fixture().await;
+        pool.close().await;
+        let out = config
+            .parent()
+            .unwrap()
+            .join(format!("legacy-journal-{point}.json"));
+        let killed = authorized_command(&config, &out)
+            .env("ASSAY_TEST_SHAMIR_KILL_POINT", point)
+            .output()
+            .unwrap();
+        assert!(!killed.status.success());
+        let path = journal_path(&out);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        journal.as_object_mut().unwrap().remove("schema_migrated");
+        std::fs::write(&path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let recovered = authorized_command(&config, &out).output().unwrap();
+        assert!(
+            recovered.status.success(),
+            "{point}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+    }
 }
 
 #[tokio::test]

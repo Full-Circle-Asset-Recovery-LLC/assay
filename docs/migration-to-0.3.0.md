@@ -229,10 +229,12 @@ database digests, bundle digest, operator UID, whether schema migration was requ
 the same transaction as the KEK change. The five-share bundle is written once with mode `0600`;
 distribute shares to separate custodians and remove the aggregate bundle after distribution.
 
-If schema migration fails, the command publishes no bundle or recovery journal. The database stays
-either in the exact legacy state or in an idempotently migrated plaintext state; rerun the same
-command only after correcting the migration error. The paired rollback manifest remains valid for
-restoring the original pre-migration generation.
+Legacy DDL, the KEK change, and the transition audit execute on the same anchored SQLite connection
+inside one `BEGIN EXCLUSIVE` transaction. A schema or precommit failure publishes no bundle or
+recovery journal and rolls the legacy schema and plaintext row back with the transition. After an
+orderly failure or process crash at that boundary, the next identical invocation can reuse the
+original pre-migration manifest. The paired rollback manifest remains valid for restoring the
+original generation.
 
 Recovery states:
 
