@@ -204,3 +204,67 @@ async fn offline_init_refuses_a_fresh_engine_instance_without_artifacts() {
     assert!(!result.status.success());
     assert!(!out.exists());
 }
+
+#[tokio::test]
+async fn injected_failures_rollback_before_commit_and_retain_bundle_after_commit() {
+    for point in ["after-update", "after-write"] {
+        let (_tmp, config, pool) = fixture().await;
+        pool.close().await;
+        let out = config.parent().unwrap().join(format!("{point}.json"));
+        let result = Command::new(env!("CARGO_BIN_EXE_assay-engine"))
+            .env("ASSAY_TEST_SHAMIR_FAIL_POINT", point)
+            .args(["vault", "init-shamir", "--config"])
+            .arg(&config)
+            .args(["--threshold", "3", "--shares", "5", "--shares-out"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(!out.exists());
+        let verify = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(config.parent().unwrap().join("vault.db"))
+                    .create_if_missing(false),
+            )
+            .await
+            .unwrap();
+        let method: String = sqlx::query_scalar("SELECT sealing_method FROM kek_metadata")
+            .fetch_one(&verify)
+            .await
+            .unwrap();
+        assert_eq!(method, "plaintext");
+    }
+
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("after-commit.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_assay-engine"))
+        .env("ASSAY_TEST_SHAMIR_FAIL_POINT", "after-commit")
+        .args(["vault", "init-shamir", "--config"])
+        .arg(&config)
+        .args(["--threshold", "3", "--shares", "5", "--shares-out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        out.exists(),
+        "committed transition must retain its share bundle"
+    );
+    let verify = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(config.parent().unwrap().join("vault.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let method: String = sqlx::query_scalar("SELECT sealing_method FROM kek_metadata")
+        .fetch_one(&verify)
+        .await
+        .unwrap();
+    assert_eq!(method, "shamir");
+}

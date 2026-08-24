@@ -114,6 +114,11 @@ async fn offline_init_shamir(
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
+    #[cfg(debug_assertions)]
+    let injected_failure = std::env::var("ASSAY_TEST_SHAMIR_FAIL_POINT").ok();
+    #[cfg(not(debug_assertions))]
+    let injected_failure: Option<String> = None;
+
     if (threshold, shares_count) != (3, 5) {
         anyhow::bail!("first-release Shamir initialization requires --threshold 3 --shares 5");
     }
@@ -230,6 +235,13 @@ async fn offline_init_shamir(
         for share in &mut shares {
             share.0.fill(0);
         }
+        if injected_failure.as_deref() == Some("after-update") {
+            let mut bytes = bytes;
+            for share in &mut bytes {
+                share.fill(0);
+            }
+            anyhow::bail!("injected failure after metadata update");
+        }
         Ok((kid, bytes))
     }
     .await;
@@ -293,9 +305,19 @@ async fn offline_init_shamir(
         }
         return Err(e);
     }
+    if injected_failure.as_deref() == Some("after-write") {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        if created_output {
+            let _ = std::fs::remove_file(shares_out);
+        }
+        anyhow::bail!("injected failure after bundle write");
+    }
     if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
         let _ = std::fs::remove_file(shares_out);
         return Err(anyhow::anyhow!("commit Shamir transition: {e}"));
+    }
+    if injected_failure.as_deref() == Some("after-commit") {
+        anyhow::bail!("injected failure after committed Shamir transition");
     }
     Ok(kid)
 }
