@@ -8,6 +8,9 @@ use assay_vault::crypto::kek_store::load_or_init_sqlite;
 use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+const BASELINE_V0515_SHA256: &str =
+    "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+
 fn sha256(path: &std::path::Path) -> String {
     let output = Command::new("sha256sum").arg(path).output().unwrap();
     assert!(output.status.success());
@@ -26,9 +29,11 @@ fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
     std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o700)).unwrap();
     let generation = "fixture-generation-1";
     let binary = backup.join("assay-engine");
-    let baseline_source = std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_assay-engine").into());
+    let baseline_source = std::path::PathBuf::from(
+        std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
+            .expect("ASSAY_TEST_BASELINE_BINARY must name the pinned unmodified v0.5.15 binary"),
+    );
+    assert_eq!(sha256(&baseline_source), BASELINE_V0515_SHA256);
     let version_output = Command::new(&baseline_source)
         .arg("--version")
         .output()
@@ -73,7 +78,6 @@ fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 1,
                 "generation_id": generation,
-                "authorized_operator_ids": ["operator-test"],
                 "plaintext_kek_backup_acknowledged": true,
                 "baseline_binary": {
                     "path": binary,
@@ -99,9 +103,16 @@ fn authorized_command(config: &std::path::Path, out: &std::path::Path) -> Comman
         .arg(config)
         .args(["--threshold", "3", "--shares", "5", "--shares-out"])
         .arg(out)
-        .args(["--operator-id", "operator-test", "--backup-manifest"])
+        .arg("--operator-id")
+        .arg(trusted_operator_id())
+        .arg("--backup-manifest")
         .arg(manifest);
     command
+}
+
+fn trusted_operator_id() -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("uid:{}", std::fs::metadata("/proc/self").unwrap().uid())
 }
 
 fn journal_path(out: &std::path::Path) -> std::path::PathBuf {
@@ -138,7 +149,20 @@ fn spawn_engine(config: &std::path::Path) -> Child {
 }
 
 fn spawn_binary(binary: &std::path::Path, config: &std::path::Path) -> Child {
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    command
         .args(["serve", "--config"])
         .arg(config)
         .stdin(Stdio::null())
@@ -176,6 +200,11 @@ async fn wait_ready(client: &reqwest::Client, child: &mut Child, port: u16) {
         assert!(Instant::now() < deadline, "engine did not become ready");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn direct_test_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 async fn unseal(
@@ -300,7 +329,7 @@ async fn offline_init_rejects_invalid_or_mixed_generation_backup_manifest() {
 }
 
 #[tokio::test]
-async fn offline_init_rejects_operator_not_authorized_by_backup_manifest() {
+async fn offline_init_rejects_actor_not_matching_os_identity() {
     let (_tmp, config, pool) = fixture().await;
     pool.close().await;
     let out = config.parent().unwrap().join("shares.json");
@@ -317,7 +346,7 @@ async fn offline_init_rejects_operator_not_authorized_by_backup_manifest() {
     assert!(!result.status.success());
     assert!(!out.exists());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("not authorized"),
+        String::from_utf8_lossy(&result.stderr).contains("OS operator identity"),
         "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
@@ -360,6 +389,24 @@ async fn offline_init_rejects_live_database_as_its_own_rollback_snapshot() {
 }
 
 #[tokio::test]
+async fn offline_init_requires_checkpointed_sqlite_generation_without_wal_or_shm() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("shares.json");
+    let _manifest = write_backup_manifest(&config);
+    std::fs::write(
+        config.parent().unwrap().join("vault.db-wal"),
+        b"pending-wal",
+    )
+    .unwrap();
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("checkpointed"), "stderr: {stderr}");
+    assert!(!out.exists());
+}
+
+#[tokio::test]
 async fn offline_init_rejects_relative_or_non_private_share_output_parent() {
     let (_tmp, config, pool) = fixture().await;
     pool.close().await;
@@ -369,6 +416,40 @@ async fn offline_init_rejects_relative_or_non_private_share_output_parent() {
     let result = authorized_command(&config, &out).output().unwrap();
     assert!(!result.status.success());
     assert!(!out.exists());
+}
+
+#[tokio::test]
+async fn output_parent_swap_cannot_redirect_anchored_bundle_publication() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let root = config.parent().unwrap();
+    let share_dir = root.join("share-dir");
+    std::fs::create_dir(&share_dir).unwrap();
+    std::fs::set_permissions(&share_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = share_dir.join("shares.json");
+    let ready = root.join("anchor-ready");
+    let resume = root.join("anchor-resume");
+    let mut child = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_ANCHOR_READY", &ready)
+        .env("ASSAY_TEST_SHAMIR_ANCHOR_RESUME", &resume)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "offline process never exposed anchored-dir test boundary"
+    );
+    let original = root.join("share-dir-original");
+    std::fs::rename(&share_dir, &original).unwrap();
+    std::fs::create_dir(&share_dir).unwrap();
+    std::fs::set_permissions(&share_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&resume, b"continue").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(original.join("shares.json").exists());
+    assert!(!share_dir.join("shares.json").exists());
 }
 
 #[tokio::test]
@@ -497,7 +578,7 @@ async fn committed_transition_has_complete_non_secret_audit_receipt() {
     assert_eq!(row.2, old_kid);
     assert_eq!(row.3, "plaintext");
     assert_eq!(row.4, "shamir");
-    assert_eq!(row.5, "operator-test");
+    assert_eq!(row.5, trusted_operator_id());
     assert_eq!(row.6, manifest.display().to_string());
     assert_eq!(row.7, 3);
     assert_eq!(row.8, 5);
@@ -509,6 +590,20 @@ async fn committed_transition_has_complete_non_secret_audit_receipt() {
             .await
             .unwrap();
     assert_eq!(bundle_digest, sha256(&out));
+    let receipt: (String, String, String, String) = sqlx::query_as(
+        "SELECT manifest_digest, backup_generation, baseline_binary_digest,
+                database_artifact_digests
+           FROM sealing_transition_audit",
+    )
+    .fetch_one(&verify)
+    .await
+    .unwrap();
+    assert_eq!(receipt.0, sha256(&manifest));
+    assert_eq!(receipt.1, "fixture-generation-1");
+    assert_eq!(receipt.2.len(), 64);
+    let database_digests: serde_json::Value = serde_json::from_str(&receipt.3).unwrap();
+    assert!(database_digests["engine.db"].is_string());
+    assert!(database_digests["vault.db"].is_string());
 }
 
 #[tokio::test]
@@ -567,6 +662,97 @@ async fn sigkill_after_prepared_journal_before_bundle_recovers_without_orphans()
     assert!(out.exists());
 }
 
+#[tokio::test]
+async fn postcommit_prejournal_sigkill_recovers_only_with_intact_private_bundle() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("shares.json");
+    let killed = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_KILL_POINT", "db-committed-prejournal")
+        .output()
+        .unwrap();
+    assert!(!killed.status.success());
+    assert!(out.exists());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal_path(&out)).unwrap()).unwrap();
+    assert_eq!(journal["phase"], "prepared");
+    let recovered = authorized_command(&config, &out).output().unwrap();
+    assert!(recovered.status.success());
+}
+
+#[tokio::test]
+async fn prepared_journal_with_shamir_db_and_missing_or_tampered_bundle_is_stranded() {
+    for mutation in ["missing", "tampered", "public-mode"] {
+        let (_tmp, config, pool) = fixture().await;
+        pool.close().await;
+        let out = config.parent().unwrap().join(format!("{mutation}.json"));
+        let killed = authorized_command(&config, &out)
+            .env("ASSAY_TEST_SHAMIR_KILL_POINT", "db-committed-prejournal")
+            .output()
+            .unwrap();
+        assert!(!killed.status.success());
+        match mutation {
+            "missing" => std::fs::remove_file(&out).unwrap(),
+            "tampered" => std::fs::write(&out, b"tampered").unwrap(),
+            "public-mode" => {
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let recovery = authorized_command(&config, &out).output().unwrap();
+        assert!(!recovery.status.success());
+        let stderr = String::from_utf8_lossy(&recovery.stderr);
+        assert!(stderr.contains("stranded transition"), "stderr: {stderr}");
+        let verify = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(config.parent().unwrap().join("vault.db"))
+                    .create_if_missing(false),
+            )
+            .await
+            .unwrap();
+        let method: String = sqlx::query_scalar("SELECT sealing_method FROM kek_metadata")
+            .fetch_one(&verify)
+            .await
+            .unwrap();
+        assert_eq!(method, "shamir");
+    }
+}
+
+#[tokio::test]
+async fn recovery_rejects_audit_receipt_that_does_not_match_journal_and_manifest() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("shares.json");
+    let killed = authorized_command(&config, &out)
+        .env("ASSAY_TEST_SHAMIR_KILL_POINT", "db-committed-prejournal")
+        .output()
+        .unwrap();
+    assert!(!killed.status.success());
+    let verify = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(config.parent().unwrap().join("vault.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sealing_transition_audit SET manifest_digest='tampered'")
+        .execute(&verify)
+        .await
+        .unwrap();
+    verify.close().await;
+    let recovery = authorized_command(&config, &out).output().unwrap();
+    assert!(!recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovery.stderr).contains("audit receipt mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn real_engine_restart_requires_fresh_shares_and_preserves_vault_data() {
     let (_tmp, config, pool) = fixture().await;
@@ -596,7 +782,7 @@ async fn real_engine_restart_requires_fresh_shares_and_preserves_vault_data() {
     }
     std::fs::remove_file(&out).unwrap();
     std::fs::remove_dir_all(config.parent().unwrap().join("rollback-baseline")).unwrap();
-    let client = reqwest::Client::default();
+    let client = direct_test_client();
     let base = format!("http://127.0.0.1:{port}");
 
     let mut engine = spawn_engine(&config);
@@ -779,10 +965,12 @@ async fn paired_rollback_restores_baseline_binary_and_database_generation() {
     pool.close().await;
     let port = free_port();
     configure_server(&config, port);
-    let baseline_source = std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_assay-engine").into());
-    let client = reqwest::Client::default();
+    let baseline_source = std::path::PathBuf::from(
+        std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
+            .expect("ASSAY_TEST_BASELINE_BINARY must be provided"),
+    );
+    assert_eq!(sha256(&baseline_source), BASELINE_V0515_SHA256);
+    let client = direct_test_client();
     let base = format!("http://127.0.0.1:{port}");
 
     let mut baseline = spawn_binary(&baseline_source, &config);
@@ -961,6 +1149,100 @@ async fn offline_init_refuses_a_fresh_engine_instance_without_artifacts() {
 }
 
 #[tokio::test]
+async fn every_operational_vault_table_refuses_transition_without_mutation() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "kv_meta",
+            &["INSERT INTO vault.kv_meta(path,created_at,updated_at) VALUES('p',1,1)"],
+        ),
+        (
+            "kv",
+            &[
+                "INSERT INTO vault.kv(path,version,ciphertext,nonce,wrapped_dek,kek_kid,created_at) VALUES('p',1,x'01',x'02',x'03','k',1)",
+            ],
+        ),
+        (
+            "transit_keys",
+            &["INSERT INTO vault.transit_keys(name,created_at) VALUES('k',1)"],
+        ),
+        (
+            "transit_versions",
+            &[
+                "INSERT INTO vault.transit_keys(name,created_at) VALUES('k',1)",
+                "INSERT INTO vault.transit_versions(name,version,key_wrapped,kek_kid,created_at) VALUES('k',1,x'01','k',1)",
+            ],
+        ),
+        (
+            "leases",
+            &[
+                "INSERT INTO vault.leases(id,provider,role,issued_at,expires_at) VALUES('l','p','r',1,2)",
+            ],
+        ),
+        (
+            "vaults",
+            &[
+                "INSERT INTO vault.vaults(id,owner_user,public_key,created_at) VALUES('v','u',x'01',1)",
+            ],
+        ),
+        (
+            "collections",
+            &["INSERT INTO vault.collections(id,name,created_by,created_at) VALUES('c','n','u',1)"],
+        ),
+        (
+            "collection_members",
+            &[
+                "INSERT INTO vault.collections(id,name,created_by,created_at) VALUES('c','n','u',1)",
+                "INSERT INTO vault.collection_members(collection_id,user_id,wrapped_key,added_at) VALUES('c','u',x'01',1)",
+            ],
+        ),
+        (
+            "items",
+            &[
+                "INSERT INTO vault.vaults(id,owner_user,public_key,created_at) VALUES('v','u',x'01',1)",
+                "INSERT INTO vault.items(id,vault_id,item_type,name,ciphertext,nonce,created_at,updated_at) VALUES('i','v','login','n',x'01',x'02',1,1)",
+            ],
+        ),
+        (
+            "folders",
+            &[
+                "INSERT INTO vault.vaults(id,owner_user,public_key,created_at) VALUES('v','u',x'01',1)",
+                "INSERT INTO vault.folders(id,vault_id,name,created_at) VALUES('f','v','n',1)",
+            ],
+        ),
+        (
+            "share_revoked",
+            &["INSERT INTO vault.share_revoked(key_id,revoked_at) VALUES('s',1)"],
+        ),
+        (
+            "unseal_shares",
+            &[
+                "INSERT INTO vault.unseal_shares(kid,share_index,share_holder,encrypted_share,created_at) SELECT kid,1,'u',x'01',1 FROM vault.kek_metadata LIMIT 1",
+            ],
+        ),
+        (
+            "audit_sinks",
+            &["INSERT INTO vault.audit_sinks(id,name,kind,created_at) VALUES('a','n','syslog',1)"],
+        ),
+    ];
+    for (table, statements) in cases {
+        let (_tmp, config, pool) = fixture().await;
+        for statement in *statements {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        let out = config.parent().unwrap().join(format!("{table}.json"));
+        let _manifest = write_backup_manifest(&config);
+        let vault_path = config.parent().unwrap().join("vault.db");
+        let before = std::fs::read(&vault_path).unwrap();
+        let result = authorized_command(&config, &out).output().unwrap();
+        assert!(!result.status.success(), "table {table}");
+        assert!(!out.exists(), "table {table}");
+        assert!(!journal_path(&out).exists(), "table {table}");
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before, "table {table}");
+    }
+}
+
+#[tokio::test]
 async fn injected_failures_rollback_before_commit_and_retain_bundle_after_commit() {
     for point in ["after-update", "after-write"] {
         let (_tmp, config, pool) = fixture().await;
@@ -1027,4 +1309,24 @@ async fn offline_init_refuses_process_lifetime_lock_even_without_heartbeat() {
     assert!(!result.status.success());
     assert!(!out.exists());
     assert!(String::from_utf8_lossy(&result.stderr).contains("process holds"));
+}
+
+#[tokio::test]
+async fn embedded_engine_holds_the_same_process_lock_as_offline_transition() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let port = free_port();
+    configure_server(&config, port);
+    let cfg = assay_engine::EngineConfig::from_file(&config).unwrap();
+    let embedded = assay_engine::embedded::build(cfg).await.unwrap();
+    let out = config.parent().unwrap().join("embedded-locked.json");
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("process holds"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!out.exists());
+    drop(embedded);
 }

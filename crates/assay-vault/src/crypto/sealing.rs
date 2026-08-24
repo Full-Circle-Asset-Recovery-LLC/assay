@@ -77,6 +77,7 @@ impl SealingMethod {
 pub mod shamir {
     use super::*;
     use crate::crypto::aead::KEY_LEN;
+    use zeroize::Zeroizing;
 
     /// One unseal share — the wire format an operator passes back to
     /// `unseal`. Internally it's the byte representation `sharks`
@@ -133,7 +134,7 @@ pub mod shamir {
     /// `Sealed` if fewer shares were provided; returns `Crypto` if the
     /// shares fail to reconstruct (corruption, mismatched threshold,
     /// shares from a different secret).
-    pub fn combine_shares(threshold: u8, shares: &[Share]) -> Result<[u8; KEY_LEN]> {
+    pub fn combine_shares(threshold: u8, shares: &[Share]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
         if shares.len() < threshold as usize {
             return Err(VaultError::Sealed);
         }
@@ -145,16 +146,17 @@ pub mod shamir {
                     .map_err(|e| VaultError::Crypto(format!("bad share: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        let secret = s
-            .recover(&parsed)
-            .map_err(|e| VaultError::Crypto(format!("shamir recover: {e}")))?;
+        let secret = Zeroizing::new(
+            s.recover(&parsed)
+                .map_err(|e| VaultError::Crypto(format!("shamir recover: {e}")))?,
+        );
         if secret.len() != KEY_LEN {
             return Err(VaultError::Crypto(format!(
                 "recovered secret is {} bytes; expected {KEY_LEN}",
                 secret.len()
             )));
         }
-        let mut key = [0u8; KEY_LEN];
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
         key.copy_from_slice(&secret);
         Ok(key)
     }
@@ -171,10 +173,21 @@ pub mod shamir {
             assert_eq!(shares.len(), 5);
             // Any 3 shares reconstruct.
             let recovered = combine_shares(3, &shares[..3]).unwrap();
-            assert_eq!(recovered, kek);
+            assert_eq!(*recovered, kek);
             // A different 3.
             let recovered2 = combine_shares(3, &shares[2..5]).unwrap();
-            assert_eq!(recovered2, kek);
+            assert_eq!(*recovered2, kek);
+        }
+
+        #[test]
+        fn reconstructed_secret_is_guarded_by_zeroizing_type() {
+            let kek = random_dek();
+            let shares = split_kek(&kek, 3, 5).unwrap();
+            let recovered = combine_shares(3, &shares[..3]).unwrap();
+            assert!(
+                std::any::type_name_of_val(&recovered).contains("Zeroizing"),
+                "reconstructed secret must have drop-time zeroization"
+            );
         }
 
         #[test]
@@ -203,7 +216,7 @@ pub mod shamir {
             // outright depending on where the corruption hits — either
             // way the result is NOT equal to the original.
             if let Ok(bad) = combine_shares(3, &shares[..3]) {
-                assert_ne!(bad, kek);
+                assert_ne!(*bad, kek);
             }
         }
     }

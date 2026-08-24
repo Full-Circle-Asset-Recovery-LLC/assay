@@ -14,16 +14,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupManifest {
     version: u8,
     generation_id: String,
-    authorized_operator_ids: Vec<String>,
     plaintext_kek_backup_acknowledged: bool,
     baseline_binary: BackupArtifact,
     sqlite_snapshot: Vec<BackupDatabase>,
@@ -47,6 +43,14 @@ struct BackupDatabase {
     generation_id: String,
 }
 
+#[derive(Clone)]
+struct BackupReceipt {
+    manifest_digest: String,
+    generation: String,
+    baseline_binary_digest: String,
+    database_artifact_digests: String,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransitionJournal {
@@ -57,9 +61,219 @@ struct TransitionJournal {
     new_kid: String,
     operator_id: String,
     backup_ref: String,
+    manifest_digest: String,
+    backup_generation: String,
+    baseline_binary_digest: String,
+    database_artifact_digests: String,
     bundle_digest: String,
     share_threshold: u8,
     share_count: u8,
+}
+
+#[derive(sqlx::FromRow)]
+struct TransitionAuditRow {
+    transition_id: String,
+    old_kid: String,
+    new_kid: String,
+    operator_id: String,
+    backup_ref: String,
+    manifest_digest: String,
+    backup_generation: String,
+    baseline_binary_digest: String,
+    database_artifact_digests: String,
+    bundle_digest: String,
+    share_threshold: i64,
+    share_count: i64,
+    plaintext_backup_acknowledged: i64,
+    outcome: String,
+}
+
+#[cfg(unix)]
+struct AnchoredOutput {
+    dir: std::fs::File,
+    bundle: std::ffi::CString,
+    journal: std::ffi::CString,
+    completion: std::ffi::CString,
+}
+
+#[cfg(unix)]
+impl AnchoredOutput {
+    fn open(shares_out: &std::path::Path) -> anyhow::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        validate_share_output_parent(shares_out)?;
+        let parent = shares_out.parent().expect("validated parent");
+        let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes())?;
+        // SAFETY: parent_c is NUL-terminated and flags request an owned directory fd.
+        let fd = unsafe {
+            libc::open(
+                parent_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd was just returned by open and ownership transfers to File.
+        let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let bundle_os = shares_out.file_name().expect("validated filename");
+        let bundle = std::ffi::CString::new(bundle_os.as_bytes())?;
+        let mut journal_os = bundle_os.to_os_string();
+        journal_os.push(".transition.json");
+        let journal = std::ffi::CString::new(journal_os.as_bytes())?;
+        let mut completion_os = bundle_os.to_os_string();
+        completion_os.push(".transition.complete");
+        let completion = std::ffi::CString::new(completion_os.as_bytes())?;
+        Ok(Self {
+            dir,
+            bundle,
+            journal,
+            completion,
+        })
+    }
+
+    fn exists(&self, name: &std::ffi::CStr) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: dir fd and name are valid; stat points to writable memory.
+        let result = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error.into())
+        }
+    }
+
+    fn read(&self, name: &std::ffi::CStr) -> anyhow::Result<Vec<u8>> {
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: dir fd and name are valid; returned fd is owned below.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd is newly owned by this call.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn write_new(&self, name: &std::ffi::CStr, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: dir fd and name are valid; O_EXCL + O_NOFOLLOW prevent replacement/following.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd is newly owned by this call.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.dir.sync_all()?;
+        Ok(())
+    }
+
+    fn remove(&self, name: &std::ffi::CStr, missing_ok: bool) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: dir fd and name are valid and unlinkat stays beneath the held dir.
+        let result = unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            self.dir.sync_all()?;
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if missing_ok && error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error.into())
+        }
+    }
+
+    fn atomic_write(
+        &self,
+        target: &std::ffi::CStr,
+        bytes: &[u8],
+        unique: &str,
+        create_new: bool,
+    ) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut temp = target.to_bytes().to_vec();
+        temp.extend_from_slice(format!(".{unique}.tmp").as_bytes());
+        let temp = std::ffi::CString::new(temp)?;
+        if create_new && self.exists(target)? {
+            anyhow::bail!("anchored output already exists");
+        }
+        self.write_new(&temp, bytes)?;
+        // SAFETY: both names are relative to the same held directory fd.
+        let result = unsafe {
+            libc::renameat(
+                self.dir.as_raw_fd(),
+                temp.as_ptr(),
+                self.dir.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = self.remove(&temp, true);
+            return Err(error.into());
+        }
+        self.dir.sync_all()?;
+        Ok(())
+    }
+
+    fn validate_private_bundle(&self) -> anyhow::Result<Vec<u8>> {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: dir fd, name and output pointer are valid.
+        let result = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                self.bundle.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fstatat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_mode & 0o077 != 0
+        {
+            anyhow::bail!("share bundle is not an operator-owned private regular file");
+        }
+        self.read(&self.bundle)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -187,6 +401,13 @@ async fn offline_init_shamir(
     if operator_id.trim().is_empty() {
         anyhow::bail!("--operator-id must be non-empty");
     }
+    let trusted_operator_id = trusted_operator_id()?;
+    if operator_id != trusted_operator_id {
+        anyhow::bail!(
+            "--operator-id does not match the OS operator identity {trusted_operator_id}"
+        );
+    }
+    let operator_id = trusted_operator_id.as_str();
     if !backup_manifest.is_file() {
         anyhow::bail!("--backup-manifest must identify a readable manifest file");
     }
@@ -205,15 +426,14 @@ async fn offline_init_shamir(
         anyhow::bail!("offline Shamir initialization requires persistent SQLite files");
     }
     let data_dir_path = std::path::Path::new(&data_dir);
-    validate_share_output(shares_out)?;
-    let recovery_journal = read_transition_journal(shares_out)?;
-    validate_backup_manifest(
-        backup_manifest,
-        data_dir_path,
-        operator_id,
-        recovery_journal.is_none(),
-    )?;
     let _process_lock = assay_engine::process_lock::ProcessLock::acquire(data_dir_path)?;
+    validate_checkpointed_sqlite_generation(data_dir_path)?;
+    let output = AnchoredOutput::open(shares_out)?;
+    #[cfg(debug_assertions)]
+    maybe_pause_after_output_anchor()?;
+    let recovery_journal = read_transition_journal(&output)?;
+    let backup_receipt =
+        validate_backup_manifest(backup_manifest, data_dir_path, recovery_journal.is_none())?;
     let engine_path = data_dir_path.join("engine.db");
     let vault_path = data_dir_path.join("vault.db");
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.create_if_missing(false);
@@ -241,7 +461,12 @@ async fn offline_init_shamir(
         .context("open isolated SQLite vault")?;
     let mut conn = pool.acquire().await?;
     if let Some(mut journal) = recovery_journal {
-        validate_recovery_journal(&journal, shares_out, operator_id, backup_manifest)?;
+        validate_recovery_journal_identity(
+            &journal,
+            operator_id,
+            backup_manifest,
+            &backup_receipt,
+        )?;
         let active: (String, String) =
             sqlx::query_as("SELECT kid, sealing_method FROM vault.kek_metadata")
                 .fetch_one(&mut *conn)
@@ -249,31 +474,39 @@ async fn offline_init_shamir(
                 .context("inspect interrupted Shamir transition")?;
         match (journal.phase.as_str(), active.1.as_str()) {
             ("prepared", "plaintext") => {
-                if shares_out.exists() {
-                    std::fs::remove_file(shares_out)
-                        .context("remove orphan prepared share bundle")?;
-                }
-                std::fs::remove_file(transition_journal_path(shares_out))
+                output
+                    .remove(&output.bundle, true)
+                    .context("remove orphan prepared share bundle")?;
+                output
+                    .remove(&output.journal, false)
                     .context("remove orphan prepared transition journal")?;
-                validate_backup_manifest(backup_manifest, data_dir_path, operator_id, true)?;
+                let _ = validate_backup_manifest(backup_manifest, data_dir_path, true)?;
             }
             ("prepared", "shamir") => {
                 if active.0 != journal.new_kid {
                     anyhow::bail!("prepared journal does not match committed vault KEK");
                 }
+                validate_transition_audit_receipt(&mut conn, &journal).await?;
+                validate_recovery_bundle(&output, &journal).map_err(|error| {
+                    anyhow::anyhow!("stranded transition requires paired rollback: {error}")
+                })?;
                 journal.phase = "committed".into();
-                write_transition_journal(shares_out, &journal, false)?;
-                write_transition_completion(shares_out)?;
+                write_transition_journal(&output, &journal, false)?;
+                write_transition_completion(&output)?;
                 return Ok(active.0);
             }
             ("committed", "shamir") => {
                 if active.0 != journal.new_kid {
                     anyhow::bail!("committed journal does not match active vault KEK");
                 }
-                if transition_completion_path(shares_out).exists() {
+                if output.exists(&output.completion)? {
                     anyhow::bail!("Shamir transition is already complete");
                 }
-                write_transition_completion(shares_out)?;
+                validate_transition_audit_receipt(&mut conn, &journal).await?;
+                validate_recovery_bundle(&output, &journal).map_err(|error| {
+                    anyhow::anyhow!("stranded transition requires paired rollback: {error}")
+                })?;
+                write_transition_completion(&output)?;
                 return Ok(active.0);
             }
             _ => anyhow::bail!("transition journal and vault state are inconsistent"),
@@ -399,28 +632,23 @@ async fn offline_init_shamir(
         new_kid: kid.clone(),
         operator_id: operator_id.to_owned(),
         backup_ref: backup_manifest.display().to_string(),
+        manifest_digest: backup_receipt.manifest_digest.clone(),
+        backup_generation: backup_receipt.generation.clone(),
+        baseline_binary_digest: backup_receipt.baseline_binary_digest.clone(),
+        database_artifact_digests: backup_receipt.database_artifact_digests.clone(),
         bundle_digest: bundle_digest.clone(),
         share_threshold: threshold,
         share_count: shares_count,
     };
     let mut created_output = false;
     let file_result = (|| -> anyhow::Result<()> {
-        write_transition_journal(shares_out, &journal, true)?;
+        write_transition_journal(&output, &journal, true)?;
         #[cfg(debug_assertions)]
         maybe_sigkill("journal-fsynced-prebundle");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(shares_out)
+        output
+            .write_new(&output.bundle, &bundle)
             .context("create shares-out exclusively")?;
         created_output = true;
-        file.write_all(&bundle)?;
-        file.sync_all()?;
-        if let Some(parent) = shares_out.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
         Ok(())
     })();
     for share in &mut share_bytes {
@@ -435,17 +663,17 @@ async fn offline_init_shamir(
     if let Err(e) = file_result {
         let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
         if created_output {
-            let _ = std::fs::remove_file(shares_out);
+            let _ = output.remove(&output.bundle, true);
         }
-        let _ = std::fs::remove_file(transition_journal_path(shares_out));
+        let _ = output.remove(&output.journal, true);
         return Err(e);
     }
     if injected_failure.as_deref() == Some("after-write") {
         let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
         if created_output {
-            let _ = std::fs::remove_file(shares_out);
+            let _ = output.remove(&output.bundle, true);
         }
-        let _ = std::fs::remove_file(transition_journal_path(shares_out));
+        let _ = output.remove(&output.journal, true);
         anyhow::bail!("injected failure after bundle write");
     }
     #[cfg(debug_assertions)]
@@ -459,6 +687,10 @@ async fn offline_init_shamir(
             new_method TEXT NOT NULL,
             operator_id TEXT NOT NULL,
             backup_ref TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            backup_generation TEXT NOT NULL,
+            baseline_binary_digest TEXT NOT NULL,
+            database_artifact_digests TEXT NOT NULL,
             bundle_digest TEXT NOT NULL,
             share_threshold INTEGER NOT NULL,
             share_count INTEGER NOT NULL,
@@ -473,15 +705,20 @@ async fn offline_init_shamir(
     sqlx::query(
         "INSERT INTO vault.sealing_transition_audit
             (transition_id, old_kid, new_kid, old_method, new_method, operator_id,
-             backup_ref, bundle_digest, share_threshold, share_count,
+             backup_ref, manifest_digest, backup_generation, baseline_binary_digest,
+             database_artifact_digests, bundle_digest, share_threshold, share_count,
              plaintext_backup_acknowledged, outcome, created_at)
-         VALUES (?, ?, ?, 'plaintext', 'shamir', ?, ?, ?, ?, ?, 1, 'committed', ?)",
+         VALUES (?, ?, ?, 'plaintext', 'shamir', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'committed', ?)",
     )
     .bind(&transition_id)
     .bind(&journal.old_kid)
     .bind(&journal.new_kid)
     .bind(operator_id)
     .bind(backup_manifest.display().to_string())
+    .bind(&backup_receipt.manifest_digest)
+    .bind(&backup_receipt.generation)
+    .bind(&backup_receipt.baseline_binary_digest)
+    .bind(&backup_receipt.database_artifact_digests)
     .bind(&bundle_digest)
     .bind(i64::from(threshold))
     .bind(i64::from(shares_count))
@@ -495,109 +732,137 @@ async fn offline_init_shamir(
     .await
     .context("write transition audit receipt")?;
     if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-        let _ = std::fs::remove_file(shares_out);
-        let _ = std::fs::remove_file(transition_journal_path(shares_out));
+        let _ = output.remove(&output.bundle, true);
+        let _ = output.remove(&output.journal, true);
         return Err(anyhow::anyhow!("commit Shamir transition: {e}"));
     }
+    #[cfg(debug_assertions)]
+    maybe_sigkill("db-committed-prejournal");
     journal.phase = "committed".into();
-    write_transition_journal(shares_out, &journal, false)?;
+    write_transition_journal(&output, &journal, false)?;
     #[cfg(debug_assertions)]
     maybe_sigkill("postcommit");
-    write_transition_completion(shares_out)?;
+    write_transition_completion(&output)?;
     if injected_failure.as_deref() == Some("after-commit") {
         anyhow::bail!("injected failure after committed Shamir transition");
     }
     Ok(kid)
 }
 
-fn transition_journal_path(shares_out: &std::path::Path) -> PathBuf {
-    let mut value = shares_out.as_os_str().to_os_string();
-    value.push(".transition.json");
-    value.into()
-}
-
-fn transition_completion_path(shares_out: &std::path::Path) -> PathBuf {
-    let mut value = shares_out.as_os_str().to_os_string();
-    value.push(".transition.complete");
-    value.into()
-}
-
-fn write_transition_completion(shares_out: &std::path::Path) -> anyhow::Result<()> {
-    let path = transition_completion_path(shares_out);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(&path)?;
-    file.sync_all()?;
-    std::fs::File::open(path.parent().expect("completion marker has parent"))?.sync_all()?;
+async fn validate_transition_audit_receipt(
+    conn: &mut sqlx::SqliteConnection,
+    journal: &TransitionJournal,
+) -> anyhow::Result<()> {
+    let row: TransitionAuditRow = sqlx::query_as(
+        "SELECT transition_id, old_kid, new_kid, operator_id, backup_ref,
+                manifest_digest, backup_generation, baseline_binary_digest,
+                database_artifact_digests, bundle_digest, share_threshold,
+                share_count, plaintext_backup_acknowledged, outcome
+           FROM vault.sealing_transition_audit
+          WHERE transition_id=?",
+    )
+    .bind(&journal.transition_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| anyhow::anyhow!("read transition audit receipt: {error}"))?;
+    if row.transition_id != journal.transition_id
+        || row.old_kid != journal.old_kid
+        || row.new_kid != journal.new_kid
+        || row.operator_id != journal.operator_id
+        || row.backup_ref != journal.backup_ref
+        || row.manifest_digest != journal.manifest_digest
+        || row.backup_generation != journal.backup_generation
+        || row.baseline_binary_digest != journal.baseline_binary_digest
+        || row.database_artifact_digests != journal.database_artifact_digests
+        || row.bundle_digest != journal.bundle_digest
+        || row.share_threshold != i64::from(journal.share_threshold)
+        || row.share_count != i64::from(journal.share_count)
+        || row.plaintext_backup_acknowledged != 1
+        || row.outcome != "committed"
+    {
+        anyhow::bail!("transition audit receipt mismatch; paired rollback is required");
+    }
     Ok(())
 }
 
-fn read_transition_journal(
-    shares_out: &std::path::Path,
-) -> anyhow::Result<Option<TransitionJournal>> {
-    let path = transition_journal_path(shares_out);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|error| {
-            anyhow::anyhow!("parse transition recovery journal: {error}")
-        })?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".db-wal") || name.ends_with(".db-shm") {
+            anyhow::bail!(
+                "SQLite backup generation is not checkpointed; remove WAL/SHM only after a clean service stop and checkpoint"
+            );
+        }
     }
+    Ok(())
 }
 
-fn validate_recovery_journal(
+fn trusted_operator_id() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("uid:{}", std::fs::metadata("/proc/self")?.uid()))
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("offline Shamir initialization requires an OS-derived operator identity")
+}
+
+fn write_transition_completion(output: &AnchoredOutput) -> anyhow::Result<()> {
+    output.write_new(&output.completion, &[])
+}
+
+fn read_transition_journal(output: &AnchoredOutput) -> anyhow::Result<Option<TransitionJournal>> {
+    if !output.exists(&output.journal)? {
+        return Ok(None);
+    }
+    let bytes = output.read(&output.journal)?;
+    Ok(Some(serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!("parse transition recovery journal: {error}")
+    })?))
+}
+
+fn validate_recovery_journal_identity(
     journal: &TransitionJournal,
-    shares_out: &std::path::Path,
     operator_id: &str,
     backup_manifest: &std::path::Path,
+    backup_receipt: &BackupReceipt,
 ) -> anyhow::Result<()> {
     if journal.version != 1
         || !matches!(journal.phase.as_str(), "prepared" | "committed")
         || journal.operator_id != operator_id
         || journal.backup_ref != backup_manifest.display().to_string()
+        || journal.manifest_digest != backup_receipt.manifest_digest
+        || journal.backup_generation != backup_receipt.generation
+        || journal.baseline_binary_digest != backup_receipt.baseline_binary_digest
+        || journal.database_artifact_digests != backup_receipt.database_artifact_digests
         || journal.share_threshold != 3
         || journal.share_count != 5
     {
         anyhow::bail!("transition recovery journal does not match this operation");
     }
-    match std::fs::read(shares_out) {
-        Ok(bytes) => {
-            if sha256_bytes(&bytes) != journal.bundle_digest {
-                anyhow::bail!("transition share bundle checksum mismatch");
-            }
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && journal.phase == "prepared" => {}
-        Err(error) => return Err(anyhow::anyhow!("read transition share bundle: {error}")),
+    Ok(())
+}
+
+fn validate_recovery_bundle(
+    output: &AnchoredOutput,
+    journal: &TransitionJournal,
+) -> anyhow::Result<()> {
+    let bytes = output.validate_private_bundle()?;
+    if sha256_bytes(&bytes) != journal.bundle_digest {
+        anyhow::bail!("share bundle checksum mismatch");
     }
     Ok(())
 }
 
 fn write_transition_journal(
-    shares_out: &std::path::Path,
+    output: &AnchoredOutput,
     journal: &TransitionJournal,
     create_new: bool,
 ) -> anyhow::Result<()> {
-    let path = transition_journal_path(shares_out);
-    if create_new && path.exists() {
-        anyhow::bail!("transition recovery journal already exists");
-    }
-    let mut temporary_name = path.as_os_str().to_os_string();
-    temporary_name.push(format!(".{}.tmp", journal.transition_id));
-    let temporary_path = PathBuf::from(temporary_name);
     let bytes = serde_json::to_vec_pretty(journal)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary_path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary_path, &path)?;
-    std::fs::File::open(path.parent().expect("journal has parent"))?.sync_all()?;
-    Ok(())
+    output.atomic_write(&output.journal, &bytes, &journal.transition_id, create_new)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -621,7 +886,26 @@ fn maybe_sigkill(point: &str) {
     }
 }
 
-fn validate_share_output(shares_out: &std::path::Path) -> anyhow::Result<()> {
+#[cfg(debug_assertions)]
+fn maybe_pause_after_output_anchor() -> anyhow::Result<()> {
+    let (Ok(ready), Ok(resume)) = (
+        std::env::var("ASSAY_TEST_SHAMIR_ANCHOR_READY"),
+        std::env::var("ASSAY_TEST_SHAMIR_ANCHOR_RESUME"),
+    ) else {
+        return Ok(());
+    };
+    std::fs::write(&ready, b"ready")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::path::Path::new(&resume).exists() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting at anchored output test boundary");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+fn validate_share_output_parent(shares_out: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -632,6 +916,9 @@ fn validate_share_output(shares_out: &std::path::Path) -> anyhow::Result<()> {
     let parent = shares_out
         .parent()
         .ok_or_else(|| anyhow::anyhow!("--shares-out has no parent directory"))?;
+    if shares_out.file_name().is_none() {
+        anyhow::bail!("--shares-out must include a file name");
+    }
     let canonical_parent = parent
         .canonicalize()
         .context("canonicalize shares-out parent")?;
@@ -658,9 +945,8 @@ fn validate_share_output(shares_out: &std::path::Path) -> anyhow::Result<()> {
 fn validate_backup_manifest(
     manifest_path: &std::path::Path,
     data_dir: &std::path::Path,
-    operator_id: &str,
     require_live_match: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BackupReceipt> {
     use anyhow::Context;
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -704,6 +990,7 @@ fn validate_backup_manifest(
         }
     }
     let bytes = std::fs::read(manifest_path).context("read backup manifest")?;
+    let manifest_digest = sha256_bytes(&bytes);
     let manifest: BackupManifest =
         serde_json::from_slice(&bytes).context("parse backup manifest")?;
     if manifest.version != 1 || manifest.generation_id.trim().is_empty() {
@@ -713,13 +1000,6 @@ fn validate_backup_manifest(
         anyhow::bail!(
             "operator must acknowledge that the rollback snapshot contains the plaintext KEK"
         );
-    }
-    if !manifest
-        .authorized_operator_ids
-        .iter()
-        .any(|authorized| authorized == operator_id)
-    {
-        anyhow::bail!("operator is not authorized by the backup manifest");
     }
     if manifest.baseline_binary.generation_id != manifest.generation_id {
         anyhow::bail!("baseline binary and database snapshot generations do not match");
@@ -732,7 +1012,10 @@ fn validate_backup_manifest(
         anyhow::bail!("baseline binary version does not match this transition");
     }
 
+    let baseline_binary_digest = manifest.baseline_binary.sha256.clone();
+    let generation = manifest.generation_id.clone();
     let mut entries = BTreeMap::new();
+    let mut artifact_digests = BTreeMap::new();
     for database in manifest.sqlite_snapshot {
         if database.generation_id != manifest.generation_id {
             anyhow::bail!("mixed database generations in backup manifest");
@@ -747,6 +1030,7 @@ fn validate_backup_manifest(
         if digest_file(&database.path)? != database.sha256 {
             anyhow::bail!("backup database checksum mismatch for {}", database.name);
         }
+        artifact_digests.insert(database.name.clone(), database.sha256.clone());
         if entries.insert(database.name, database.path).is_some() {
             anyhow::bail!("duplicate database in backup manifest");
         }
@@ -773,7 +1057,12 @@ fn validate_backup_manifest(
             }
         }
     }
-    Ok(())
+    Ok(BackupReceipt {
+        manifest_digest,
+        generation,
+        baseline_binary_digest,
+        database_artifact_digests: serde_json::to_string(&artifact_digests)?,
+    })
 }
 
 fn validate_private_backup_artifact(path: &std::path::Path, label: &str) -> anyhow::Result<()> {

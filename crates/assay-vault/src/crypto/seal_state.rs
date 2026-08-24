@@ -242,7 +242,7 @@ impl SealState {
                      corrupted or tampered share."
                 )));
             }
-            let handle = KekHandle::from_bytes(kid.clone(), key);
+            let handle = KekHandle::from_zeroizing(kid.clone(), key);
             g.accumulator = None;
             g.pending_activation = true;
             return Ok(ShareSubmission::Ready(PendingKek { kid, handle }));

@@ -78,6 +78,10 @@ pub struct EmbeddedEngine {
 
     /// `assay-engine` crate version.
     pub engine_version: &'static str,
+
+    /// Held for the full lifetime of every persistent SQLite engine so
+    /// embedded and standalone users contend with offline administration.
+    _process_lock: Option<crate::process_lock::ProcessLock>,
 }
 
 /// Backend-typed pool. Engine's internal code paths are backend-
@@ -111,13 +115,16 @@ pub enum EmbeddedPool {
 /// ctx-build failure, precondition failure. The `Err` carries a
 /// helpful operator-facing message when the cause is configuration.
 pub async fn build(cfg: EngineConfig) -> anyhow::Result<EmbeddedEngine> {
+    let process_lock = process_lock_for_config(&cfg)?;
     let boot = EngineBoot::run(&cfg).await?;
-    match boot {
+    let mut engine = match boot {
         #[cfg(feature = "backend-postgres")]
         EngineBoot::Postgres(b) => build_pg(cfg, b).await,
         #[cfg(feature = "backend-sqlite")]
         EngineBoot::Sqlite(b) => build_sqlite(cfg, b).await,
-    }
+    }?;
+    engine._process_lock = process_lock;
+    Ok(engine)
 }
 
 #[cfg(feature = "backend-postgres")]
@@ -267,6 +274,7 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
         instance_id,
         modules,
         engine_version: env!("CARGO_PKG_VERSION"),
+        _process_lock: None,
     })
 }
 
@@ -278,6 +286,18 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
 /// booting workflow scheduler / vault unseal / etc. Equivalent to
 /// `EngineBoot::run(cfg).await?;` with a more discoverable name.
 pub async fn migrate(cfg: &EngineConfig) -> anyhow::Result<()> {
+    let _process_lock = process_lock_for_config(cfg)?;
     let _boot = EngineBoot::run(cfg).await?;
     Ok(())
+}
+
+fn process_lock_for_config(
+    cfg: &EngineConfig,
+) -> anyhow::Result<Option<crate::process_lock::ProcessLock>> {
+    match cfg.backend.sqlite_data_dir() {
+        Some(data_dir) if data_dir != ":memory:" => Ok(Some(
+            crate::process_lock::ProcessLock::acquire(std::path::Path::new(&data_dir))?,
+        )),
+        _ => Ok(None),
+    }
 }

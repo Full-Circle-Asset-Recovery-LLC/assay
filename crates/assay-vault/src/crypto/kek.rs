@@ -75,6 +75,12 @@ impl KekHandle {
         }
     }
 
+    /// Construct from a drop-zeroizing source buffer. The handle's inner
+    /// key has its own `Drop` zeroization; the consumed source is wiped too.
+    pub fn from_zeroizing(kid: impl Into<String>, key: zeroize::Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self::from_bytes(kid, *key)
+    }
+
     /// Generate a fresh ephemeral KEK with a content-addressed kid.
     /// Useful for tests + first-boot bootstrap before any persistence
     /// path runs.

@@ -88,12 +88,6 @@ pub use state::{AdminApiKeys, EngineState};
 /// For embedded use (composing engine into a parent binary's
 /// router), call [`embedded::build`] directly.
 pub async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
-    let _process_lock = match cfg.backend.sqlite_data_dir() {
-        Some(data_dir) if data_dir != ":memory:" => Some(process_lock::ProcessLock::acquire(
-            std::path::Path::new(&data_dir),
-        )?),
-        _ => None,
-    };
     let bind_addr = cfg.server.bind_addr.clone();
     let engine = embedded::build(cfg).await?;
     server::bind_and_serve(&bind_addr, engine.router).await

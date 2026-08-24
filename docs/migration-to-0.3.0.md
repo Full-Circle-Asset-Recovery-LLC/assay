@@ -18,7 +18,8 @@ operators upgrading from v0.2.x.
   `--no-default-features --features "..."` (excluding `vault`).
 - **Master KEK** is generated on first boot and stored in `vault.kek_metadata` with
   `sealing_method = 'plaintext'` (Phase-1 placeholder). Migrate to Shamir or Cloud KMS sealing
-  before production via `POST /api/v1/vault/sys/init`.
+  before production. Online initialization is disabled; SQLite operators use the offline
+  `assay-engine vault init-shamir` ceremony below.
 - **HA failover tightened** to ~10s — `engine.instances` heartbeat drops from 15s to 3s, stale
   cutoff from 60s to 10s. Existing PG deployments take effect on next boot; no migration needed.
 
@@ -91,7 +92,7 @@ POST    /share/revoke              { revocation_id, reason }
 GET     /sys/seal-status
 POST    /sys/seal
 POST    /sys/unseal                { share_b64 }
-POST    /sys/init                  { threshold, shares_count }
+POST    /sys/init                  disabled; always refuses initialization
 
 POST    /dynamic/{provider}/{role}/lease  body: { ttl_secs? }
 GET     /dynamic/leases?provider=…
@@ -166,17 +167,58 @@ On first v0.3.0 boot, the engine generates a fresh 32-byte KEK and persists it i
 'plaintext'`. The plaintext stance is a Phase-1
 placeholder; engine boot logs a WARN.
 
-To migrate to Shamir Secret Sharing:
+To migrate a SQLite vault to Shamir Secret Sharing, use this fail-closed offline ceremony. The
+first release supports exactly 3-of-5 shares.
+
+1. Stop every standalone or embedded engine using the SQLite data directory. Confirm no `.db-wal`
+   or `.db-shm` files remain after a clean checkpoint. The offline command takes the same
+   `assay-engine.lock` as every engine entrypoint and refuses if any engine still holds it.
+2. Create a complete rollback generation containing every top-level `*.db` file plus the exact
+   unmodified `assay-engine` binary for this version. The private rollback directory must be owned
+   by the invoking OS user with mode `0700`; the manifest, binary, and database snapshots must be
+   regular non-symlink files with mode `0600`.
+3. Write a version-1 JSON manifest with one generation ID across the baseline binary and every
+   database artifact, SHA-256 for every artifact, and
+   `"plaintext_kek_backup_acknowledged": true`. This acknowledgment is required because the
+   rollback `vault.db` still contains the old plaintext KEK. Encrypt the rollback generation with
+   age or an approved KMS before long-term retention; never retain the plaintext staging copy.
+4. Create a canonical absolute, operator-owned, non-symlink share-output directory with mode
+   `0700`. The trusted operator identity is derived from the effective OS UID. Supply it exactly as
+   `uid:$(id -u)`; a self-selected identity is rejected.
+
+Example:
 
 ```bash
-curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
-  -d '{"threshold":3,"shares_count":5}' \
-  http://engine/api/v1/vault/sys/init
-# Response: { kid, shares_b64: ["...", "...", ...], threshold, shares_count }
-# Distribute the shares to operators. The engine does NOT retain a copy.
+install -d -m 0700 /secure/assay-shamir
+assay-engine vault init-shamir \
+  --config /etc/assay/engine.toml \
+  --threshold 3 \
+  --shares 5 \
+  --shares-out /secure/assay-shamir/shares.json \
+  --operator-id "uid:$(id -u)" \
+  --backup-manifest /secure/assay-rollback/manifest.json
 ```
 
-After init, restart the engine. It will boot sealed; submit shares:
+The command validates and hashes the manifest, pinned binary, complete checkpointed SQLite
+generation, and output directory while holding the process lock. It writes a non-secret transition
+audit receipt containing the manifest digest, generation, binary digest, database digests, bundle
+digest, operator UID, and outcome in the same transaction as the KEK change. The five-share bundle
+is written once with mode `0600`; distribute shares to separate custodians and remove the aggregate
+bundle after distribution.
+
+Recovery states:
+
+- `prepared` journal + plaintext database: the next identical invocation removes any orphan bundle
+  and safely restarts the transition.
+- `prepared` journal + Shamir database: recovery succeeds only when the anchored private bundle is
+  present and its digest matches. A missing, replaced, public-mode, or tampered bundle is a stranded
+  transition and requires restoring the paired baseline binary and complete database generation.
+- `committed` journal without completion marker: the next identical invocation verifies the
+  receipt and bundle, writes the completion marker, and returns success.
+- completion marker present: the transition is complete; repeating initialization is refused.
+
+After a successful transition, restart the engine. It boots sealed with progress zero. Submit three
+distinct shares; a malformed, duplicate, or corrupt share resets the ceremony immediately:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
@@ -195,6 +237,11 @@ curl -H "Authorization: Bearer $ADMIN_KEY" \
 
 Cloud-KMS auto-unseal (AWS / GCP) lands in v0.3.x; the trait shape is reserved. Until then, Shamir
 is the production path.
+
+Rollback is paired: restore every database artifact and the exact baseline binary from the same
+manifest generation. Never mix binary and database generations. Boot the restored baseline and
+verify a pre-transition workflow sentinel before removing plaintext rollback staging. Encrypt any
+retained rollback with age or KMS.
 
 #### HA failover playbook (plan §S9)
 
