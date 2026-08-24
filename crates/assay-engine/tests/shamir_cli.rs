@@ -84,6 +84,7 @@ fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
                     "sha256": sha256(&binary),
                     "generation_id": generation,
                     "version": version,
+                    "source_commit": "3977f552391917874589530d0d23094559e68e29",
                 },
                 "sqlite_snapshot": sqlite_snapshot,
             }))
@@ -329,6 +330,29 @@ async fn offline_init_rejects_invalid_or_mixed_generation_backup_manifest() {
 }
 
 #[tokio::test]
+async fn offline_init_rejects_arbitrary_binary_self_labeled_as_v0515() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("shares.json");
+    let manifest = write_backup_manifest(&config);
+    let fake = config
+        .parent()
+        .unwrap()
+        .join("rollback-baseline/fake-assay-engine");
+    std::fs::write(&fake, b"not the trusted release binary").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    value["baseline_binary"]["path"] = serde_json::Value::String(fake.display().to_string());
+    value["baseline_binary"]["sha256"] = serde_json::Value::String(sha256(&fake));
+    value["baseline_binary"]["version"] = serde_json::Value::String("0.5.15".into());
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(!result.status.success());
+    assert!(!out.exists());
+}
+
+#[tokio::test]
 async fn offline_init_rejects_actor_not_matching_os_identity() {
     let (_tmp, config, pool) = fixture().await;
     pool.close().await;
@@ -404,6 +428,50 @@ async fn offline_init_requires_checkpointed_sqlite_generation_without_wal_or_shm
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("checkpointed"), "stderr: {stderr}");
     assert!(!out.exists());
+}
+
+#[tokio::test]
+async fn offline_init_refuses_persistent_wal_mode_even_without_sidecars() {
+    let (_tmp, config, pool) = fixture().await;
+    for schema in ["engine", "vault"] {
+        let mode: String = sqlx::query_scalar(&format!("PRAGMA {schema}.journal_mode=WAL"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        let _: i64 = sqlx::query_scalar(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+    for entry in std::fs::read_dir(config.parent().unwrap()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if name.ends_with("-wal") || name.ends_with("-shm") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let out = config.parent().unwrap().join("wal-mode.json");
+    let _manifest = write_backup_manifest(&config);
+    let before = [
+        std::fs::read(config.parent().unwrap().join("engine.db")).unwrap(),
+        std::fs::read(config.parent().unwrap().join("vault.db")).unwrap(),
+    ];
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("journal_mode=DELETE"), "stderr: {stderr}");
+    assert!(!out.exists());
+    assert!(!journal_path(&out).exists());
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("engine.db")).unwrap(),
+        before[0]
+    );
+    assert_eq!(
+        std::fs::read(config.parent().unwrap().join("vault.db")).unwrap(),
+        before[1]
+    );
 }
 
 #[tokio::test]

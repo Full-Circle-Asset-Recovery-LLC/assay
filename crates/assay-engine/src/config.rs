@@ -137,6 +137,13 @@ impl BackendConfig {
             Self::Postgres { .. } => None,
         }
     }
+
+    pub(crate) fn anchor_sqlite_data_dir(&mut self, anchored: &std::path::Path) {
+        if let Self::Sqlite { data_dir, path } = self {
+            *data_dir = anchored.display().to_string();
+            *path = None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

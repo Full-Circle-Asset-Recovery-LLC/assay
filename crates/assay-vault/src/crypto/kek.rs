@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::crypto::aead::{KEY_LEN, NONCE_LEN, decrypt, encrypt, random_nonce};
 use crate::error::{Result, VaultError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// In-memory KEK material. Cheap to clone — the inner Arc shares the
 /// raw bytes across consumers without re-allocating.
@@ -30,15 +31,10 @@ pub struct KekHandle {
     inner: Arc<KekInner>,
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct KekInner {
     kid: String,
     key: [u8; KEY_LEN],
-}
-
-impl Drop for KekInner {
-    fn drop(&mut self) {
-        self.key.fill(0);
-    }
 }
 
 /// Fully-resolved wrapped DEK — the bytes the storage layer puts on

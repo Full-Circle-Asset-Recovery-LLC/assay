@@ -11,6 +11,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -38,6 +39,8 @@ impl EngineProcess {
     fn spawn() -> Self {
         let port = free_port();
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
         let db_path = tmp.path().join("engine.db");
         let cfg_path = tmp.path().join("engine.toml");
 

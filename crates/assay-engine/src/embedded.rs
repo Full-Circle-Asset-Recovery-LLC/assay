@@ -114,8 +114,14 @@ pub enum EmbeddedPool {
 /// Returns `Err` on any of: pool-open failure, migration failure,
 /// ctx-build failure, precondition failure. The `Err` carries a
 /// helpful operator-facing message when the cause is configuration.
-pub async fn build(cfg: EngineConfig) -> anyhow::Result<EmbeddedEngine> {
+pub async fn build(mut cfg: EngineConfig) -> anyhow::Result<EmbeddedEngine> {
     let process_lock = process_lock_for_config(&cfg)?;
+    if let Some(anchored) = process_lock
+        .as_ref()
+        .and_then(crate::process_lock::ProcessLock::anchored_data_dir)
+    {
+        cfg.backend.anchor_sqlite_data_dir(&anchored);
+    }
     let boot = EngineBoot::run(&cfg).await?;
     let mut engine = match boot {
         #[cfg(feature = "backend-postgres")]
@@ -286,8 +292,15 @@ async fn compose<S: WorkflowStore + Clone + 'static>(
 /// booting workflow scheduler / vault unseal / etc. Equivalent to
 /// `EngineBoot::run(cfg).await?;` with a more discoverable name.
 pub async fn migrate(cfg: &EngineConfig) -> anyhow::Result<()> {
-    let _process_lock = process_lock_for_config(cfg)?;
-    let _boot = EngineBoot::run(cfg).await?;
+    let process_lock = process_lock_for_config(cfg)?;
+    let mut anchored_cfg = cfg.clone();
+    if let Some(anchored) = process_lock
+        .as_ref()
+        .and_then(crate::process_lock::ProcessLock::anchored_data_dir)
+    {
+        anchored_cfg.backend.anchor_sqlite_data_dir(&anchored);
+    }
+    let _boot = EngineBoot::run(&anchored_cfg).await?;
     Ok(())
 }
 

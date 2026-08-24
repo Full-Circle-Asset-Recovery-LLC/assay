@@ -77,19 +77,13 @@ impl SealingMethod {
 pub mod shamir {
     use super::*;
     use crate::crypto::aead::KEY_LEN;
-    use zeroize::Zeroizing;
+    use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
     /// One unseal share — the wire format an operator passes back to
     /// `unseal`. Internally it's the byte representation `sharks`
     /// produces.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
     pub struct Share(pub Vec<u8>);
-
-    impl Drop for Share {
-        fn drop(&mut self) {
-            self.0.fill(0);
-        }
-    }
 
     impl Share {
         pub fn from_bytes(b: Vec<u8>) -> Self {

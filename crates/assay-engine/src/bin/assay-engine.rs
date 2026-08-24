@@ -15,6 +15,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+const TRUSTED_BASELINE_VERSION: &str = "0.5.15";
+const TRUSTED_BASELINE_SOURCE_COMMIT: &str = "3977f552391917874589530d0d23094559e68e29";
+const TRUSTED_BASELINE_SHA256: &str =
+    "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupManifest {
@@ -32,6 +37,7 @@ struct BackupArtifact {
     sha256: String,
     generation_id: String,
     version: String,
+    source_commit: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -49,6 +55,12 @@ struct BackupReceipt {
     generation: String,
     baseline_binary_digest: String,
     database_artifact_digests: String,
+}
+
+struct PreparedShares {
+    kid: String,
+    shares: zeroize::Zeroizing<Vec<Vec<u8>>>,
+    old_kid: String,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -99,8 +111,9 @@ struct AnchoredOutput {
 #[cfg(unix)]
 impl AnchoredOutput {
     fn open(shares_out: &std::path::Path) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::io::FromRawFd;
 
         validate_share_output_parent(shares_out)?;
         let parent = shares_out.parent().expect("validated parent");
@@ -117,6 +130,20 @@ impl AnchoredOutput {
         }
         // SAFETY: fd was just returned by open and ownership transfers to File.
         let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: held fd is valid and stat points to writable memory.
+        if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect opened shares-out parent");
+        }
+        // SAFETY: fstat succeeded.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_mode & 0o077 != 0
+        {
+            anyhow::bail!("opened shares-out parent must be operator-owned mode 0700 or stricter");
+        }
         let bundle_os = shares_out.file_name().expect("validated filename");
         let bundle = std::ffi::CString::new(bundle_os.as_bytes())?;
         let mut journal_os = bundle_os.to_os_string();
@@ -276,6 +303,38 @@ impl AnchoredOutput {
     }
 }
 
+#[cfg(not(unix))]
+struct AnchoredOutput {
+    bundle: std::ffi::CString,
+    journal: std::ffi::CString,
+    completion: std::ffi::CString,
+}
+
+#[cfg(not(unix))]
+impl AnchoredOutput {
+    fn open(_: &std::path::Path) -> anyhow::Result<Self> {
+        anyhow::bail!("offline Shamir initialization requires Unix dirfd safety primitives")
+    }
+    fn exists(&self, _: &std::ffi::CStr) -> anyhow::Result<bool> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+    fn read(&self, _: &std::ffi::CStr) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+    fn write_new(&self, _: &std::ffi::CStr, _: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+    fn remove(&self, _: &std::ffi::CStr, _: bool) -> anyhow::Result<()> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+    fn atomic_write(&self, _: &std::ffi::CStr, _: &[u8], _: &str, _: bool) -> anyhow::Result<()> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+    fn validate_private_bundle(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("offline Shamir initialization is unavailable on this platform")
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "assay-engine", version, about = "Assay workflow + auth engine")]
 struct Cli {
@@ -389,6 +448,7 @@ async fn offline_init_shamir(
     use assay_vault::crypto::sealing::shamir::split_kek;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use zeroize::Zeroizing;
 
     #[cfg(debug_assertions)]
     let injected_failure = std::env::var("ASSAY_TEST_SHAMIR_FAIL_POINT").ok();
@@ -425,8 +485,12 @@ async fn offline_init_shamir(
     if data_dir == ":memory:" {
         anyhow::bail!("offline Shamir initialization requires persistent SQLite files");
     }
-    let data_dir_path = std::path::Path::new(&data_dir);
-    let _process_lock = assay_engine::process_lock::ProcessLock::acquire(data_dir_path)?;
+    let configured_data_dir = std::path::Path::new(&data_dir);
+    let _process_lock = assay_engine::process_lock::ProcessLock::acquire(configured_data_dir)?;
+    let anchored_data_dir = _process_lock
+        .anchored_data_dir()
+        .unwrap_or_else(|| configured_data_dir.to_path_buf());
+    let data_dir_path = anchored_data_dir.as_path();
     validate_checkpointed_sqlite_generation(data_dir_path)?;
     let output = AnchoredOutput::open(shares_out)?;
     #[cfg(debug_assertions)]
@@ -517,7 +581,7 @@ async fn offline_init_shamir(
         .await
         .context("acquire exclusive SQLite vault transaction")?;
 
-    let result: anyhow::Result<(String, Vec<Vec<u8>>, String)> = async {
+    let result: anyhow::Result<PreparedShares> = async {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -559,15 +623,14 @@ async fn offline_init_shamir(
         if rows.len() != 1 || rows[0].1 != "plaintext" || rows[0].2.len() != 32 {
             anyhow::bail!("expected exactly one valid plaintext KEK source row");
         }
-        let (kid, _, mut blob) = rows.into_iter().next().expect("one row checked above");
+        let (kid, _, blob) = rows.into_iter().next().expect("one row checked above");
+        let blob = Zeroizing::new(blob);
         let old_kid = kid.clone();
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&blob);
-        blob.fill(0);
         let digest = assay_vault::crypto::kek_store::full_kek_digest(&key);
-        let mut shares = split_kek(&key, threshold, shares_count)
+        let shares = split_kek(&key, threshold, shares_count)
             .map_err(|e| anyhow::anyhow!("split KEK: {e}"))?;
-        key.fill(0);
 
         sqlx::query(
             "UPDATE vault.kek_metadata
@@ -581,32 +644,35 @@ async fn offline_init_shamir(
         .execute(&mut *conn)
         .await
         .context("stage Shamir metadata transition")?;
-        let bytes = shares.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
-        for share in &mut shares {
-            share.0.fill(0);
-        }
+        let bytes = Zeroizing::new(shares.iter().map(|s| s.0.clone()).collect::<Vec<_>>());
         if injected_failure.as_deref() == Some("after-update") {
-            let mut bytes = bytes;
-            for share in &mut bytes {
-                share.fill(0);
-            }
             anyhow::bail!("injected failure after metadata update");
         }
-        Ok((kid, bytes, old_kid))
+        Ok(PreparedShares {
+            kid,
+            shares: bytes,
+            old_kid,
+        })
     }
     .await;
 
-    let (kid, mut share_bytes, old_kid) = match result {
+    let PreparedShares {
+        kid,
+        shares: share_bytes,
+        old_kid,
+    } = match result {
         Ok(value) => value,
         Err(e) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Err(e);
         }
     };
-    let mut encoded = share_bytes
-        .iter()
-        .map(|s| assay_vault::crypto::sealing::shamir::encode_share_base64(s))
-        .collect::<Vec<_>>();
+    let encoded = Zeroizing::new(
+        share_bytes
+            .iter()
+            .map(|s| assay_vault::crypto::sealing::shamir::encode_share_base64(s))
+            .collect::<Vec<_>>(),
+    );
     #[derive(serde::Serialize)]
     struct ShareBundle<'a> {
         version: u8,
@@ -615,13 +681,13 @@ async fn offline_init_shamir(
         shares_count: u8,
         shares_b64: &'a [String],
     }
-    let mut bundle = serde_json::to_vec_pretty(&ShareBundle {
+    let bundle = Zeroizing::new(serde_json::to_vec_pretty(&ShareBundle {
         version: 1,
         kid: &kid,
         threshold,
         shares_count,
         shares_b64: &encoded,
-    })?;
+    })?);
     let bundle_digest = sha256_bytes(&bundle);
     let transition_id = uuid::Uuid::now_v7().to_string();
     let mut journal = TransitionJournal {
@@ -651,15 +717,6 @@ async fn offline_init_shamir(
         created_output = true;
         Ok(())
     })();
-    for share in &mut share_bytes {
-        share.fill(0);
-    }
-    for value in &mut encoded {
-        let len = value.len();
-        value.clear();
-        value.extend(std::iter::repeat_n('\0', len));
-    }
-    bundle.fill(0);
     if let Err(e) = file_result {
         let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
         if created_output {
@@ -786,6 +843,9 @@ async fn validate_transition_audit_receipt(
 }
 
 fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    let mut databases = Vec::new();
     for entry in std::fs::read_dir(data_dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -793,6 +853,30 @@ fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow
         if name.ends_with(".db-wal") || name.ends_with(".db-shm") {
             anyhow::bail!(
                 "SQLite backup generation is not checkpointed; remove WAL/SHM only after a clean service stop and checkpoint"
+            );
+        }
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("db")
+        {
+            databases.push(entry.path());
+        }
+    }
+    databases.sort();
+    for database in databases {
+        let mut header = [0u8; 20];
+        std::fs::File::open(&database)?.read_exact(&mut header)?;
+        if &header[..16] != b"SQLite format 3\0" {
+            anyhow::bail!("{} is not a valid SQLite database", database.display());
+        }
+        if (header[18], header[19]) != (1, 1) {
+            anyhow::bail!(
+                "SQLite database {} must persist journal_mode=DELETE before offline Shamir initialization; header write/read versions are {}/{}",
+                database.display(),
+                header[18],
+                header[19]
             );
         }
     }
@@ -905,6 +989,7 @@ fn maybe_pause_after_output_anchor() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_share_output_parent(shares_out: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     #[cfg(unix)]
@@ -1008,8 +1093,12 @@ fn validate_backup_manifest(
     if digest_file(&manifest.baseline_binary.path)? != manifest.baseline_binary.sha256 {
         anyhow::bail!("baseline binary checksum mismatch");
     }
-    if manifest.baseline_binary.version != env!("CARGO_PKG_VERSION") {
-        anyhow::bail!("baseline binary version does not match this transition");
+    if manifest.baseline_binary.version != TRUSTED_BASELINE_VERSION
+        || manifest.baseline_binary.version != env!("CARGO_PKG_VERSION")
+        || manifest.baseline_binary.source_commit != TRUSTED_BASELINE_SOURCE_COMMIT
+        || manifest.baseline_binary.sha256 != TRUSTED_BASELINE_SHA256
+    {
+        anyhow::bail!("baseline binary does not match the trusted release attestation");
     }
 
     let baseline_binary_digest = manifest.baseline_binary.sha256.clone();
