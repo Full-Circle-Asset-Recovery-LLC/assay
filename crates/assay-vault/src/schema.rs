@@ -236,8 +236,8 @@ CREATE INDEX IF NOT EXISTS idx_vault_biscuit_root_active
 -- depends on `sealing_method`:
 --   plaintext       — Phase 1 placeholder; blob IS the raw 32-byte KEK.
 --                     Tracked in kek_metadata so Phase 2 can re-wrap.
---   shamir          — blob is empty; the KEK is split into rows in
---                     vault.unseal_shares and reconstituted on unseal.
+--   shamir          — blob is empty; one-shot shares are returned to the
+--                     operator and never persisted by the first release.
 --   kms-aws / kms-gcp — blob is the cloud-KMS-encrypted KEK; auto-unseal
 --                     calls the cloud KMS Decrypt API on boot.
 --   hsm             — blob is the PKCS#11-wrapped KEK (opt-in feature).
@@ -246,6 +246,7 @@ CREATE TABLE IF NOT EXISTS vault.kek_metadata (
     sealing_method   TEXT NOT NULL,
     sealed           BOOLEAN NOT NULL DEFAULT TRUE,
     sealed_blob      BYTEA NOT NULL DEFAULT ''::bytea,
+    kek_digest       BYTEA,
     share_threshold  INTEGER,
     share_count      INTEGER,
     sealed_at        DOUBLE PRECISION,
@@ -253,9 +254,8 @@ CREATE TABLE IF NOT EXISTS vault.kek_metadata (
     created_at       DOUBLE PRECISION NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())
 );
 
--- Shamir-Secret-Sharing shares for the init-unseal flow. Encrypted at
--- rest with the share-holder's identity key (X25519) so a stolen DB
--- snapshot doesn't yield the KEK.
+-- Reserved for a future identity-encrypted share escrow flow. First-release
+-- Shamir initialization never writes this table.
 CREATE TABLE IF NOT EXISTS vault.unseal_shares (
     kid              TEXT NOT NULL REFERENCES vault.kek_metadata(kid) ON DELETE CASCADE,
     share_index      INTEGER NOT NULL,
@@ -479,6 +479,7 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
             sealing_method   TEXT NOT NULL,
             sealed           INTEGER NOT NULL DEFAULT 1,
             sealed_blob      BLOB NOT NULL DEFAULT x'',
+            kek_digest       BLOB,
             share_threshold  INTEGER,
             share_count      INTEGER,
             sealed_at        REAL,
@@ -530,6 +531,10 @@ pub async fn migrate_postgres(pool: &sqlx::PgPool) -> anyhow::Result<()> {
                 .with_context(|| format!("vault pg migrate: {}", first_line(&stmt)))?;
         }
     }
+    sqlx::query("ALTER TABLE vault.kek_metadata ADD COLUMN IF NOT EXISTS kek_digest BYTEA")
+        .execute(pool)
+        .await
+        .context("vault pg migrate: add kek_digest")?;
     sqlx::query(
         "INSERT INTO engine.migrations (module, version) VALUES ($1, $2) \
          ON CONFLICT DO NOTHING",
@@ -557,6 +562,18 @@ pub async fn migrate_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("vault sqlite migrate: {label}"))?;
         }
+    }
+    let has_digest: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vault.pragma_table_info('kek_metadata') WHERE name = 'kek_digest')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect vault.kek_metadata columns")?;
+    if !has_digest {
+        sqlx::query("ALTER TABLE vault.kek_metadata ADD COLUMN kek_digest BLOB")
+            .execute(pool)
+            .await
+            .context("vault sqlite migrate: add kek_digest")?;
     }
     sqlx::query("INSERT OR IGNORE INTO engine.migrations (module, version) VALUES (?, ?)")
         .bind(MODULE_NAME)

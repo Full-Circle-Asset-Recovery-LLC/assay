@@ -39,6 +39,29 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "vault")]
+fn vault_ctx_from_active(
+    active: assay_vault::crypto::kek_store::ActiveKek,
+) -> anyhow::Result<assay_vault::VaultCtx> {
+    match active {
+        assay_vault::crypto::kek_store::ActiveKek::Plaintext { handle, .. } => {
+            Ok(assay_vault::VaultCtx::new().with_kek(handle))
+        }
+        assay_vault::crypto::kek_store::ActiveKek::Shamir {
+            kid,
+            threshold,
+            shares_count,
+            kek_digest,
+        } => Ok(assay_vault::VaultCtx::new().with_sealed_shamir(
+            kid,
+            kek_digest,
+            threshold,
+            shares_count,
+        )),
+        _ => anyhow::bail!("unsupported active vault KEK sealing method"),
+    }
+}
+
 pub mod config;
 pub mod embedded;
 pub mod engine_api;
@@ -81,14 +104,20 @@ async fn build_vault_ctx_pg(
     if !modules.iter().any(|m| m == "vault") {
         return Ok(None);
     }
-    let kek = assay_vault::crypto::kek_store::load_or_init_postgres(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("vault KEK bootstrap (pg): {e}"))?;
+    let active = match assay_vault::crypto::kek_store::load_active_postgres(pool).await? {
+        Some(active) => active,
+        None => {
+            let handle = assay_vault::crypto::kek_store::load_or_init_postgres(pool).await?;
+            assay_vault::crypto::kek_store::ActiveKek::Plaintext {
+                kid: handle.kid().to_string(),
+                handle,
+            }
+        }
+    };
     // The `vault` umbrella feature on assay-vault implies vault-kv +
     // vault-transit, so the with_* methods are unconditionally
     // available here.
-    let mut ctx = assay_vault::VaultCtx::new()
-        .with_kek(kek)
+    let mut ctx = vault_ctx_from_active(active)?
         .with_kv(assay_vault::store::postgres::PgKvStore::new(pool.clone()))
         .with_transit(assay_vault::store::postgres::PgTransitStore::new(
             pool.clone(),
@@ -147,11 +176,17 @@ async fn build_vault_ctx_sqlite(
     if !modules.iter().any(|m| m == "vault") {
         return Ok(None);
     }
-    let kek = assay_vault::crypto::kek_store::load_or_init_sqlite(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("vault KEK bootstrap (sqlite): {e}"))?;
-    let mut ctx = assay_vault::VaultCtx::new()
-        .with_kek(kek)
+    let active = match assay_vault::crypto::kek_store::load_active_sqlite(pool).await? {
+        Some(active) => active,
+        None => {
+            let handle = assay_vault::crypto::kek_store::load_or_init_sqlite(pool).await?;
+            assay_vault::crypto::kek_store::ActiveKek::Plaintext {
+                kid: handle.kid().to_string(),
+                handle,
+            }
+        }
+    };
+    let mut ctx = vault_ctx_from_active(active)?
         .with_kv(assay_vault::store::sqlite::SqliteKvStore::new(pool.clone()))
         .with_transit(assay_vault::store::sqlite::SqliteTransitStore::new(
             pool.clone(),
@@ -700,6 +735,22 @@ data_dir = ":memory:"
         );
         assert_eq!(options.token_ttl, std::time::Duration::from_secs(1200));
         assert_eq!(options.request_cooldown, std::time::Duration::from_secs(90));
+    }
+
+    #[cfg(feature = "vault-sealing-shamir")]
+    #[test]
+    fn shamir_active_kek_builds_a_sealed_context() {
+        let active = assay_vault::crypto::kek_store::ActiveKek::Shamir {
+            kid: "kek-test".into(),
+            threshold: 3,
+            shares_count: 5,
+            kek_digest: [7; 32],
+        };
+        let ctx = vault_ctx_from_active(active).unwrap();
+        let status = ctx.seal_state.status();
+        assert!(status.sealed);
+        assert_eq!(status.method.as_column(), "shamir");
+        assert_eq!(status.share_threshold, Some(3));
     }
 }
 

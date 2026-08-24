@@ -135,8 +135,14 @@ impl VaultCtx {
     /// shares via `/sys/unseal` to bring it up. The KEK held on the
     /// ctx is a placeholder until then — handlers must check
     /// `seal_state.require_unsealed()` before using it.
-    pub fn with_sealed_shamir(mut self, kid: String, threshold: u8, shares_count: u8) -> Self {
-        self.seal_state = SealState::sealed_shamir(kid, threshold, shares_count);
+    pub fn with_sealed_shamir(
+        mut self,
+        kid: String,
+        kek_digest: [u8; 32],
+        threshold: u8,
+        shares_count: u8,
+    ) -> Self {
+        self.seal_state = SealState::sealed_shamir(kid, kek_digest, threshold, shares_count);
         self
     }
 
