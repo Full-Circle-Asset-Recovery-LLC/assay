@@ -74,8 +74,9 @@ async fn read_secret(dir: &Path, data_dir: &Path, tag: &str, seal: Option<&str>)
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_seal_key_the_kek_is_stored_in_the_clear() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    write_secret(dir.path(), &data, "plain", None).await;
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let data = root.join("data");
+    write_secret(&root, &data, "plain", None).await;
 
     let (method, blob) = kek_row(&data).await;
     assert_eq!(method, "plaintext");
@@ -87,8 +88,9 @@ async fn without_a_seal_key_the_kek_is_stored_in_the_clear() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_seal_key_encrypts_the_kek_and_still_opens_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    write_secret(dir.path(), &data, "sealed", Some(SEAL_KEY_A)).await;
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let data = root.join("data");
+    write_secret(&root, &data, "sealed", Some(SEAL_KEY_A)).await;
 
     let (method, blob) = kek_row(&data).await;
     assert_eq!(method, "env-aes-gcm");
@@ -98,7 +100,7 @@ async fn a_seal_key_encrypts_the_kek_and_still_opens_it() {
         "version byte, 12-byte nonce, 32 bytes of key and a 16-byte tag"
     );
 
-    let value = read_secret(dir.path(), &data, "sealed-2", Some(SEAL_KEY_A)).await;
+    let value = read_secret(&root, &data, "sealed-2", Some(SEAL_KEY_A)).await;
     assert_eq!(value, SECRET, "the secret must survive a sealed restart");
 }
 
@@ -107,12 +109,13 @@ async fn a_seal_key_encrypts_the_kek_and_still_opens_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_existing_plaintext_store_is_resealed_and_keeps_its_secrets() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    write_secret(dir.path(), &data, "before", None).await;
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let data = root.join("data");
+    write_secret(&root, &data, "before", None).await;
     let (method, _) = kek_row(&data).await;
     assert_eq!(method, "plaintext", "precondition: stored in the clear");
 
-    let value = read_secret(dir.path(), &data, "reseal", Some(SEAL_KEY_A)).await;
+    let value = read_secret(&root, &data, "reseal", Some(SEAL_KEY_A)).await;
     assert_eq!(
         value, SECRET,
         "secrets written before sealing must still read"
@@ -123,7 +126,7 @@ async fn an_existing_plaintext_store_is_resealed_and_keeps_its_secrets() {
     assert_eq!(blob.len(), 61);
 
     // Re-running with the same key changes nothing and still works.
-    let again = read_secret(dir.path(), &data, "reseal-2", Some(SEAL_KEY_A)).await;
+    let again = read_secret(&root, &data, "reseal-2", Some(SEAL_KEY_A)).await;
     assert_eq!(again, SECRET);
     assert_eq!(kek_row(&data).await.0, "env-aes-gcm");
 }
@@ -133,14 +136,15 @@ async fn an_existing_plaintext_store_is_resealed_and_keeps_its_secrets() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sealed_store_refuses_to_boot_without_the_right_key() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data = dir.path().join("data");
-    write_secret(dir.path(), &data, "locked", Some(SEAL_KEY_A)).await;
+    let root = dir.path().canonicalize().expect("canonical tempdir");
+    let data = root.join("data");
+    write_secret(&root, &data, "locked", Some(SEAL_KEY_A)).await;
 
     for (tag, key, expected) in [
         ("no-key", None, "is not set"),
         ("wrong-key", Some(SEAL_KEY_B), "does not decrypt"),
     ] {
-        let mut engine = EngineProcess::spawn_with_env(dir.path(), tag, &backend(&data), key);
+        let mut engine = EngineProcess::spawn_with_env(&root, tag, &backend(&data), key);
         let err = engine
             .wait_ready(&client())
             .await
