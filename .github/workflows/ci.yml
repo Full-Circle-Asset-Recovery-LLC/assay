@@ -430,7 +430,7 @@ jobs:
 
           labels = set(
               re.findall(
-                  rb"GLIBC_(\\d+(?:\\.\\d+)+)",
+                  rb"GLIBC_(\d+(?:\.\d+)+)",
                   subprocess.check_output(["readelf", "--version-info", sys.argv[1]]),
               )
           )
@@ -508,7 +508,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Release changelog regression tests
-        run: python3 .github/release/test_extract_changelog.py
+        run: |
+          python3 .github/release/test_extract_changelog.py
+          python3 .github/ci/test_artifact_packaging.py
 
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/deploy.yml
