@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "asset_name": "assay-engine-darwin-aarch64",
+    "sha256": "b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0",
+    "size_bytes": 16914848,
+    "target": "aarch64-apple-darwin",
+    "version_output": "assay-engine 0.5.15"
+  },
+  "source": {
+    "repository": "developerinlondon/assay",
+    "commit": "3977f552391917874589530d0d23094559e68e29",
+    "provenance": "upstream published release",
+    "slsa_provenance": null
+  },
+  "distribution": {
+    "repository": "developerinlondon/assay",
+    "release_id": 373775957,
+    "release_tag": "assay-engine-v0.5.15",
+    "release_state": "published",
+    "prerelease": false,
+    "tag_object_sha": "f93223bc34412936217df5932da33c991fab2e02",
+    "asset_id": 522323083
+  }
+}

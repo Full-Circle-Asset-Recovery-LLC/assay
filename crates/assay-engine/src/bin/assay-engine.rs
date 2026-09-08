@@ -17,8 +17,32 @@ use clap::Parser;
 
 const TRUSTED_BASELINE_VERSION: &str = "0.5.15";
 const TRUSTED_BASELINE_SOURCE_COMMIT: &str = "3977f552391917874589530d0d23094559e68e29";
-const TRUSTED_BASELINE_SHA256: &str =
-    "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+
+fn trusted_baseline_sha256() -> anyhow::Result<&'static str> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Ok("eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Ok("b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0")
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    {
+        anyhow::bail!(
+            "offline Shamir initialization has no trusted v0.5.15 baseline for this target"
+        )
+    }
+}
+
+#[cfg(unix)]
+fn current_uid() -> libc::uid_t {
+    // SAFETY: geteuid reads process credentials and has no preconditions.
+    unsafe { libc::geteuid() }
+}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1024,8 +1048,7 @@ fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow
 fn trusted_operator_id() -> anyhow::Result<String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!("uid:{}", std::fs::metadata("/proc/self")?.uid()))
+        Ok(format!("uid:{}", current_uid()))
     }
     #[cfg(not(unix))]
     anyhow::bail!("offline Shamir initialization requires an OS-derived operator identity")
@@ -1154,7 +1177,7 @@ fn validate_share_output_parent(shares_out: &std::path::Path) -> anyhow::Result<
     }
     #[cfg(unix)]
     {
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = current_uid();
         if metadata.uid() != operator_uid {
             anyhow::bail!("--shares-out parent must be owned by the operator");
         }
@@ -1207,7 +1230,7 @@ fn validate_backup_manifest(
     {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(manifest_path)?;
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = current_uid();
         if metadata.uid() != operator_uid || metadata.mode() & 0o077 != 0 {
             anyhow::bail!("--backup-manifest must be operator-owned and private");
         }
@@ -1233,7 +1256,7 @@ fn validate_backup_manifest(
     }
     if manifest.baseline_binary.version != TRUSTED_BASELINE_VERSION
         || manifest.baseline_binary.source_commit != TRUSTED_BASELINE_SOURCE_COMMIT
-        || manifest.baseline_binary.sha256 != TRUSTED_BASELINE_SHA256
+        || manifest.baseline_binary.sha256 != trusted_baseline_sha256()?
     {
         anyhow::bail!("baseline binary does not match the trusted release attestation");
     }
@@ -1314,7 +1337,7 @@ fn validate_private_backup_artifact(path: &std::path::Path, label: &str) -> anyh
     let parent_metadata = std::fs::symlink_metadata(parent)?;
     #[cfg(unix)]
     {
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = current_uid();
         if metadata.uid() != operator_uid || metadata.mode() & 0o077 != 0 {
             anyhow::bail!("{label} must be operator-owned and mode 0600 or stricter");
         }

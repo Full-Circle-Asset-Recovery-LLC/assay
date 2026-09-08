@@ -8,18 +8,44 @@ use assay_vault::crypto::kek_store::load_or_init_sqlite;
 use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-const BASELINE_V0515_SHA256: &str =
-    "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+fn baseline_v0515_sha256() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0"
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    {
+        panic!("no trusted v0.5.15 baseline exists for this target")
+    }
+}
 
 fn sha256(path: &std::path::Path) -> String {
-    let output = Command::new("sha256sum").arg(path).output().unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned()
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
 }
 
 fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
@@ -33,7 +59,7 @@ fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
         std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
             .expect("ASSAY_TEST_BASELINE_BINARY must name the pinned unmodified v0.5.15 binary"),
     );
-    assert_eq!(sha256(&baseline_source), BASELINE_V0515_SHA256);
+    assert_eq!(sha256(&baseline_source), baseline_v0515_sha256());
     let version_output = Command::new(&baseline_source)
         .arg("--version")
         .output()
@@ -112,8 +138,8 @@ fn authorized_command(config: &std::path::Path, out: &std::path::Path) -> Comman
 }
 
 fn trusted_operator_id() -> String {
-    use std::os::unix::fs::MetadataExt;
-    format!("uid:{}", std::fs::metadata("/proc/self").unwrap().uid())
+    // SAFETY: geteuid reads process credentials and has no preconditions.
+    format!("uid:{}", unsafe { libc::geteuid() })
 }
 
 fn journal_path(out: &std::path::Path) -> std::path::PathBuf {
@@ -299,7 +325,8 @@ async fn unseal(
 async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, sqlx::SqlitePool) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let data_dir = tmp.path().join("data");
+    let root = tmp.path().canonicalize().unwrap();
+    let data_dir = root.join("data");
     std::fs::create_dir(&data_dir).unwrap();
     std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = data_dir.join("engine.db");
@@ -360,7 +387,8 @@ async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, sqlx::SqlitePool) 
 async fn legacy_v0515_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let data_dir = tmp.path().join("data");
+    let root = tmp.path().canonicalize().unwrap();
+    let data_dir = root.join("data");
     std::fs::create_dir(&data_dir).unwrap();
     std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let engine = data_dir.join("engine.db");
@@ -495,10 +523,11 @@ async fn actual_baseline_v0515_child_creates_legacy_schema_then_candidate_transi
     );
     let temp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let data_dir = temp.path().join("data");
+    let root = temp.path().canonicalize().unwrap();
+    let data_dir = root.join("data");
     std::fs::create_dir(&data_dir).unwrap();
     std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let config = temp.path().join("engine.toml");
+    let config = root.join("engine.toml");
     let port = free_port();
     std::fs::write(
         &config,
@@ -512,7 +541,13 @@ async fn actual_baseline_v0515_child_creates_legacy_schema_then_candidate_transi
         std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
             .expect("ASSAY_TEST_BASELINE_BINARY must be provided"),
     );
-    assert_eq!(sha256(&baseline), BASELINE_V0515_SHA256);
+    assert_eq!(sha256(&baseline), baseline_v0515_sha256());
+    let version = Command::new(&baseline).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        "assay-engine 0.5.15"
+    );
     let mut child = spawn_binary(&baseline, &config);
     let client = direct_test_client();
     wait_ready(&client, &mut child, port).await;
@@ -1613,7 +1648,7 @@ async fn paired_rollback_restores_baseline_binary_and_database_generation() {
         std::env::var_os("ASSAY_TEST_BASELINE_BINARY")
             .expect("ASSAY_TEST_BASELINE_BINARY must be provided"),
     );
-    assert_eq!(sha256(&baseline_source), BASELINE_V0515_SHA256);
+    assert_eq!(sha256(&baseline_source), baseline_v0515_sha256());
     let client = direct_test_client();
     let base = format!("http://127.0.0.1:{port}");
 
@@ -2162,8 +2197,9 @@ async fn engine_boot_creates_missing_data_dir_mode_0700_under_umask_0002() {
 
     let temp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let data_dir = temp.path().join("new-data");
-    let config = temp.path().join("engine.toml");
+    let root = temp.path().canonicalize().unwrap();
+    let data_dir = root.join("new-data");
+    let config = root.join("engine.toml");
     let port = free_port();
     std::fs::write(
         &config,
