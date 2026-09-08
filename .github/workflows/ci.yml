@@ -308,11 +308,34 @@ jobs:
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux'
         run: echo "TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres" >> "$GITHUB_ENV"
 
+      - name: Use private temporary directory for engine Lua tests
+        id: engine_tmp
+        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.engine_lua == 'true'
+        shell: bash
+        run: |
+          private_tmp=$(mktemp -d "$RUNNER_TEMP/assay-tmp.XXXXXX")
+          chmod 700 "$private_tmp"
+          echo "path=$private_tmp" >> "$GITHUB_OUTPUT"
+          echo "TMPDIR=$private_tmp" >> "$GITHUB_ENV"
+
       - name: moon run selected checks
         if: steps.targets.outputs.run_checks == 'true'
-        run: moon run ${{ steps.targets.outputs.targets }} --color
+        run: |
+          umask 077
+          moon run ${{ steps.targets.outputs.targets }} --color
         env:
           MOON_LOG: "info"
+
+      - name: Remove private engine Lua temporary directory
+        if: always() && steps.engine_tmp.outputs.path != ''
+        shell: bash
+        env:
+          PRIVATE_TMP: ${{ steps.engine_tmp.outputs.path }}
+        run: |
+          case "$PRIVATE_TMP" in
+            "$RUNNER_TEMP"/assay-tmp.*) rm -rf -- "$PRIVATE_TMP" ;;
+            *) echo "Refusing to remove unexpected path: $PRIVATE_TMP" >&2; exit 1 ;;
+          esac
 
       - name: Cleanup self-hosted Postgres test databases
         if: always() && steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux' && runner.environment == 'self-hosted'
