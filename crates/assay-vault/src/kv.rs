@@ -151,7 +151,7 @@ impl<S: KvStore> KvService<S> {
     /// `Value::Null` or `serde_json::json!({})` to leave it untouched.
     pub async fn put(&self, path: &str, plaintext: &[u8], custom_md: Value) -> Result<i64> {
         validate_path(path)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let dek = random_dek();
         let nonce = random_nonce();
         let aad = path_aad(path);
@@ -177,7 +177,7 @@ impl<S: KvStore> KvService<S> {
     /// so the caller can choose to surface "this secret was deleted".
     pub async fn get(&self, path: &str, version: Option<i64>) -> Result<KvRead> {
         validate_path(path)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let row = match version {
             Some(v) => self.store.get_row(path, v).await?,
             None => self.store.get_latest_row(path).await?,

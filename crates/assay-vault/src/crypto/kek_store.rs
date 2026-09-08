@@ -18,6 +18,7 @@
 use anyhow::Context;
 
 use crate::crypto::aead::{KEY_LEN, random_dek};
+use crate::crypto::env_seal::{ENV_VAR, METHOD_ENV, SealKey};
 use crate::crypto::kek::KekHandle;
 
 /// Sealing method — the column value in `vault.kek_metadata`.
@@ -45,6 +46,8 @@ pub const OPERATIONAL_TABLES: &[&str] = &[
 pub enum ActiveKek {
     /// Plaintext sealing (Phase 1 placeholder). The KEK is in memory.
     Plaintext { kid: String, handle: KekHandle },
+    /// Environment-sealed at rest and unsealed during boot.
+    Environment { kid: String, handle: KekHandle },
     /// Shamir-sealed. The engine cannot use the vault until the
     /// operator submits `threshold` shares.
     Shamir {
@@ -53,6 +56,57 @@ pub enum ActiveKek {
         shares_count: u8,
         kek_digest: [u8; 32],
     },
+}
+
+fn active_from_row(
+    kid: String,
+    method: String,
+    blob: Vec<u8>,
+    threshold: Option<i64>,
+    shares_count: Option<i64>,
+    digest: Option<Vec<u8>>,
+    seal: Option<&SealKey>,
+) -> anyhow::Result<ActiveKek> {
+    match method.as_str() {
+        METHOD_PLAINTEXT => {
+            let key = parse_plaintext_blob(&method, &blob)
+                .with_context(|| format!("unwrap plaintext KEK kid={kid}"))?;
+            if seal.is_none() {
+                warn_if_plaintext(&kid, &method);
+            }
+            Ok(ActiveKek::Plaintext {
+                kid: kid.clone(),
+                handle: KekHandle::from_bytes(kid, key),
+            })
+        }
+        METHOD_ENV => {
+            let seal = seal.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vault KEK kid={kid} is sealed with {METHOD_ENV} but {ENV_VAR} is not set; \
+                     set it to the key this store was sealed with"
+                )
+            })?;
+            let key = seal.unseal(&kid, &blob)?;
+            Ok(ActiveKek::Environment {
+                kid: kid.clone(),
+                handle: KekHandle::from_bytes(kid, key),
+            })
+        }
+        METHOD_SHAMIR => {
+            let kek_digest = parse_digest(&kid, digest)?;
+            let (threshold, shares_count) = validate_shamir_params(&kid, threshold, shares_count)?;
+            Ok(ActiveKek::Shamir {
+                kid,
+                threshold,
+                shares_count,
+                kek_digest,
+            })
+        }
+        other => anyhow::bail!(
+            "vault.kek_metadata.sealing_method = '{other}' is not yet supported; \
+             current build handles plaintext + environment + shamir"
+        ),
+    }
 }
 
 #[cfg(feature = "vault-sealing-shamir")]
@@ -68,6 +122,19 @@ use crate::crypto::sealing::shamir::{Share, split_kek};
 /// them in plaintext is the explicit Phase 1 trade-off.
 #[cfg(feature = "backend-postgres")]
 pub async fn load_or_init_postgres(pool: &sqlx::PgPool) -> anyhow::Result<KekHandle> {
+    load_or_init_postgres_sealed(pool, None).await
+}
+
+/// Load the active KEK, sealing it under `seal` when one is supplied.
+///
+/// A store already holding a plaintext KEK is re-sealed in place on the
+/// first boot that has a seal key, so turning sealing on is a restart
+/// rather than a migration. Re-running with the same key is a no-op.
+#[cfg(feature = "backend-postgres")]
+pub async fn load_or_init_postgres_sealed(
+    pool: &sqlx::PgPool,
+    seal: Option<&SealKey>,
+) -> anyhow::Result<KekHandle> {
     let existing: Option<(String, String, Vec<u8>)> = sqlx::query_as(
         "SELECT kid, sealing_method, sealed_blob
            FROM vault.kek_metadata
@@ -79,32 +146,56 @@ pub async fn load_or_init_postgres(pool: &sqlx::PgPool) -> anyhow::Result<KekHan
     .context("read vault.kek_metadata")?;
 
     if let Some((kid, method, blob)) = existing {
-        let key = parse_plaintext_blob(&method, &blob)
-            .with_context(|| format!("unwrap KEK kid={kid}"))?;
-        warn_if_plaintext(&kid, &method);
+        let key = open_stored_kek(&kid, &method, &blob, seal)?;
+        if let Some(seal) = seal
+            && method == METHOD_PLAINTEXT
+        {
+            let resealed = seal.seal(&kid, &key)?;
+            sqlx::query(
+                "UPDATE vault.kek_metadata
+                    SET sealing_method = $1, sealed_blob = $2
+                  WHERE kid = $3",
+            )
+            .bind(METHOD_ENV)
+            .bind(resealed)
+            .bind(&kid)
+            .execute(pool)
+            .await
+            .context("re-seal vault.kek_metadata")?;
+            warn_resealed(&kid);
+        }
         return Ok(KekHandle::from_bytes(kid, key));
     }
 
     let key = random_dek();
     let handle = KekHandle::from_bytes(content_addressed_kid(&key), key);
+    let (method, blob) = seal_for_storage(handle.kid(), &key, seal)?;
     sqlx::query(
         "INSERT INTO vault.kek_metadata
             (kid, sealing_method, sealed, sealed_blob, sealed_at, unsealed_at)
          VALUES ($1, $2, FALSE, $3, NULL, EXTRACT(EPOCH FROM NOW()))",
     )
     .bind(handle.kid())
-    .bind(METHOD_PLAINTEXT)
-    .bind(key.as_slice())
+    .bind(method)
+    .bind(blob)
     .execute(pool)
     .await
     .context("seed vault.kek_metadata")?;
-    warn_first_boot_plaintext(handle.kid());
     Ok(handle)
 }
 
 /// SQLite mirror of [`load_or_init_postgres`].
 #[cfg(feature = "backend-sqlite")]
 pub async fn load_or_init_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<KekHandle> {
+    load_or_init_sqlite_sealed(pool, None).await
+}
+
+/// SQLite mirror of [`load_or_init_postgres_sealed`].
+#[cfg(feature = "backend-sqlite")]
+pub async fn load_or_init_sqlite_sealed(
+    pool: &sqlx::SqlitePool,
+    seal: Option<&SealKey>,
+) -> anyhow::Result<KekHandle> {
     let existing: Option<(String, String, Vec<u8>)> = sqlx::query_as(
         "SELECT kid, sealing_method, sealed_blob
            FROM vault.kek_metadata
@@ -116,14 +207,30 @@ pub async fn load_or_init_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<KekH
     .context("read vault.kek_metadata")?;
 
     if let Some((kid, method, blob)) = existing {
-        let key = parse_plaintext_blob(&method, &blob)
-            .with_context(|| format!("unwrap KEK kid={kid}"))?;
-        warn_if_plaintext(&kid, &method);
+        let key = open_stored_kek(&kid, &method, &blob, seal)?;
+        if let Some(seal) = seal
+            && method == METHOD_PLAINTEXT
+        {
+            let resealed = seal.seal(&kid, &key)?;
+            sqlx::query(
+                "UPDATE vault.kek_metadata
+                    SET sealing_method = ?, sealed_blob = ?
+                  WHERE kid = ?",
+            )
+            .bind(METHOD_ENV)
+            .bind(resealed)
+            .bind(&kid)
+            .execute(pool)
+            .await
+            .context("re-seal vault.kek_metadata")?;
+            warn_resealed(&kid);
+        }
         return Ok(KekHandle::from_bytes(kid, key));
     }
 
     let key = random_dek();
     let handle = KekHandle::from_bytes(content_addressed_kid(&key), key);
+    let (method, blob) = seal_for_storage(handle.kid(), &key, seal)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -134,15 +241,240 @@ pub async fn load_or_init_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<KekH
          VALUES (?, ?, 0, ?, NULL, ?, ?)",
     )
     .bind(handle.kid())
-    .bind(METHOD_PLAINTEXT)
-    .bind(key.as_slice())
+    .bind(method)
+    .bind(blob)
     .bind(now)
     .bind(now)
     .execute(pool)
     .await
     .context("seed vault.kek_metadata")?;
-    warn_first_boot_plaintext(handle.kid());
     Ok(handle)
+}
+
+/// Load or create the one authoritative active SQLite KEK row.
+///
+/// The selected row carries its sealing method and material together.
+/// Plaintext-to-environment resealing is bound to that exact `kid` and
+/// method so a concurrent row change cannot make boot use mismatched
+/// metadata and key bytes.
+#[cfg(feature = "backend-sqlite")]
+pub async fn load_or_init_active_sqlite(
+    pool: &sqlx::SqlitePool,
+    seal: Option<&SealKey>,
+) -> anyhow::Result<ActiveKek> {
+    let row: Option<SqliteKekRow> = sqlx::query_as(
+        "SELECT kid, sealing_method, sealed_blob, share_threshold, share_count, kek_digest
+           FROM vault.kek_metadata
+          ORDER BY created_at DESC, kid DESC
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read authoritative vault.kek_metadata row")?;
+
+    if let Some((kid, method, blob, threshold, shares_count, digest)) = row {
+        let blob_for_reseal = blob.clone();
+        let active = active_from_row(
+            kid.clone(),
+            method.clone(),
+            blob,
+            threshold,
+            shares_count,
+            digest,
+            seal,
+        )?;
+        if let (ActiveKek::Plaintext { handle, .. }, Some(seal)) = (&active, seal) {
+            let key = parse_plaintext_blob(METHOD_PLAINTEXT, &blob_for_reseal)?;
+            let resealed = seal.seal(&kid, &key)?;
+            let changed = sqlx::query(
+                "UPDATE vault.kek_metadata
+                    SET sealing_method = ?, sealed_blob = ?
+                  WHERE kid = ? AND sealing_method = ?",
+            )
+            .bind(METHOD_ENV)
+            .bind(resealed)
+            .bind(&kid)
+            .bind(METHOD_PLAINTEXT)
+            .execute(pool)
+            .await
+            .context("re-seal authoritative vault.kek_metadata row")?
+            .rows_affected();
+            if changed != 1 {
+                anyhow::bail!("active vault KEK row changed during environment reseal");
+            }
+            warn_resealed(&kid);
+            return Ok(ActiveKek::Environment {
+                kid,
+                handle: handle.clone(),
+            });
+        }
+        return Ok(active);
+    }
+
+    let key = random_dek();
+    let kid = content_addressed_kid(&key);
+    let handle = KekHandle::from_bytes(kid.clone(), key);
+    let (method, blob) = seal_for_storage(&kid, &key, seal)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    sqlx::query(
+        "INSERT INTO vault.kek_metadata
+            (kid, sealing_method, sealed, sealed_blob, sealed_at, unsealed_at, created_at)
+         VALUES (?, ?, 0, ?, NULL, ?, ?)",
+    )
+    .bind(&kid)
+    .bind(method)
+    .bind(blob)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("seed authoritative vault.kek_metadata row")?;
+    match seal {
+        Some(_) => Ok(ActiveKek::Environment { kid, handle }),
+        None => Ok(ActiveKek::Plaintext { kid, handle }),
+    }
+}
+
+/// Postgres mirror of [`load_or_init_active_sqlite`].
+#[cfg(feature = "backend-postgres")]
+pub async fn load_or_init_active_postgres(
+    pool: &sqlx::PgPool,
+    seal: Option<&SealKey>,
+) -> anyhow::Result<ActiveKek> {
+    let row: Option<PgKekRow> = sqlx::query_as(
+        "SELECT kid, sealing_method, sealed_blob, share_threshold, share_count, kek_digest
+           FROM vault.kek_metadata
+          ORDER BY created_at DESC, kid DESC
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("read authoritative vault.kek_metadata row")?;
+
+    if let Some((kid, method, blob, threshold, shares_count, digest)) = row {
+        let blob_for_reseal = blob.clone();
+        let active = active_from_row(
+            kid.clone(),
+            method.clone(),
+            blob,
+            threshold.map(i64::from),
+            shares_count.map(i64::from),
+            digest,
+            seal,
+        )?;
+        if let (ActiveKek::Plaintext { handle, .. }, Some(seal)) = (&active, seal) {
+            let key = parse_plaintext_blob(METHOD_PLAINTEXT, &blob_for_reseal)?;
+            let resealed = seal.seal(&kid, &key)?;
+            let changed = sqlx::query(
+                "UPDATE vault.kek_metadata
+                    SET sealing_method = $1, sealed_blob = $2
+                  WHERE kid = $3 AND sealing_method = $4",
+            )
+            .bind(METHOD_ENV)
+            .bind(resealed)
+            .bind(&kid)
+            .bind(METHOD_PLAINTEXT)
+            .execute(pool)
+            .await
+            .context("re-seal authoritative vault.kek_metadata row")?
+            .rows_affected();
+            if changed != 1 {
+                anyhow::bail!("active vault KEK row changed during environment reseal");
+            }
+            warn_resealed(&kid);
+            return Ok(ActiveKek::Environment {
+                kid,
+                handle: handle.clone(),
+            });
+        }
+        return Ok(active);
+    }
+
+    let key = random_dek();
+    let kid = content_addressed_kid(&key);
+    let handle = KekHandle::from_bytes(kid.clone(), key);
+    let (method, blob) = seal_for_storage(&kid, &key, seal)?;
+    sqlx::query(
+        "INSERT INTO vault.kek_metadata
+            (kid, sealing_method, sealed, sealed_blob, sealed_at, unsealed_at)
+         VALUES ($1, $2, FALSE, $3, NULL, EXTRACT(EPOCH FROM NOW()))",
+    )
+    .bind(&kid)
+    .bind(method)
+    .bind(blob)
+    .execute(pool)
+    .await
+    .context("seed authoritative vault.kek_metadata row")?;
+    match seal {
+        Some(_) => Ok(ActiveKek::Environment { kid, handle }),
+        None => Ok(ActiveKek::Plaintext { kid, handle }),
+    }
+}
+
+/// Open a stored KEK according to the method its row records.
+///
+/// An env-sealed row without a seal key is a hard error: booting on
+/// would mint a second KEK and orphan every secret the first one wraps.
+fn open_stored_kek(
+    kid: &str,
+    method: &str,
+    blob: &[u8],
+    seal: Option<&SealKey>,
+) -> anyhow::Result<[u8; KEY_LEN]> {
+    match method {
+        METHOD_PLAINTEXT => {
+            let key = parse_plaintext_blob(method, blob)
+                .with_context(|| format!("unwrap KEK kid={kid}"))?;
+            if seal.is_none() {
+                warn_if_plaintext(kid, method);
+            }
+            Ok(key)
+        }
+        METHOD_ENV => {
+            let seal = seal.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vault KEK kid={kid} is sealed with {METHOD_ENV} but {ENV_VAR} is not set; \
+                     set it to the key this store was sealed with"
+                )
+            })?;
+            Ok(seal.unseal(kid, blob)?)
+        }
+        other => anyhow::bail!("unsupported vault sealing_method '{other}' for kid={kid}"),
+    }
+}
+
+/// The method name and blob to persist for a freshly minted KEK.
+fn seal_for_storage(
+    kid: &str,
+    key: &[u8; KEY_LEN],
+    seal: Option<&SealKey>,
+) -> anyhow::Result<(&'static str, Vec<u8>)> {
+    match seal {
+        Some(seal) => {
+            tracing::info!(
+                target: "assay-vault",
+                kid = %kid,
+                "first-boot KEK sealed with the environment seal key"
+            );
+            Ok((METHOD_ENV, seal.seal(kid, key)?))
+        }
+        None => {
+            warn_first_boot_plaintext(kid);
+            Ok((METHOD_PLAINTEXT, key.to_vec()))
+        }
+    }
+}
+
+fn warn_resealed(kid: &str) {
+    tracing::warn!(
+        target: "assay-vault",
+        kid = %kid,
+        "vault KEK was stored in plaintext and has been re-sealed with {ENV_VAR}; \
+         database backups taken before now still contain the unsealed key"
+    );
 }
 
 fn parse_plaintext_blob(method: &str, blob: &[u8]) -> anyhow::Result<[u8; KEY_LEN]> {
@@ -593,6 +925,44 @@ mod tests {
         assert!(load_or_init_sqlite(&pool).await.is_err());
     }
 
+    #[tokio::test]
+    async fn unified_loader_reopens_an_environment_sealed_kek_with_its_method() {
+        let pool = boot_pool().await;
+        let seal =
+            SealKey::derive("environment-seal-key-with-at-least-thirty-two-characters").unwrap();
+        let original = load_or_init_sqlite_sealed(&pool, Some(&seal))
+            .await
+            .unwrap();
+
+        match load_or_init_active_sqlite(&pool, Some(&seal))
+            .await
+            .unwrap()
+        {
+            ActiveKek::Environment { kid, handle } => {
+                assert_eq!(kid, original.kid());
+                assert_eq!(handle.kid(), original.kid());
+            }
+            _ => panic!("expected environment-sealed active KEK"),
+        }
+    }
+
+    #[cfg(feature = "vault-sealing-shamir")]
+    #[tokio::test]
+    async fn unified_loader_keeps_shamir_sealed_even_when_an_environment_key_exists() {
+        let pool = boot_pool().await;
+        let (kid, _, _) = init_shamir_sqlite(&pool, 3, 5).await.unwrap();
+        let seal =
+            SealKey::derive("environment-seal-key-with-at-least-thirty-two-characters").unwrap();
+
+        match load_or_init_active_sqlite(&pool, Some(&seal))
+            .await
+            .unwrap()
+        {
+            ActiveKek::Shamir { kid: loaded, .. } => assert_eq!(loaded, kid),
+            _ => panic!("Shamir must remain sealed on every restart"),
+        }
+    }
+
     #[cfg(feature = "vault-sealing-shamir")]
     #[tokio::test]
     async fn shamir_init_is_sealed_and_loads_as_active_without_secret_material() {
@@ -625,7 +995,9 @@ mod tests {
                 assert_eq!((threshold, shares_count), (3, 5));
                 assert_eq!(kek_digest.len(), 32);
             }
-            ActiveKek::Plaintext { .. } => panic!("expected shamir"),
+            ActiveKek::Plaintext { .. } | ActiveKek::Environment { .. } => {
+                panic!("expected shamir")
+            }
         }
     }
 

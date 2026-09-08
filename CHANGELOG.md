@@ -2,6 +2,591 @@
 
 All notable changes to Assay are documented here.
 
+## assay-lua 0.20.7 — 2026-09-04
+
+### Added
+
+- **`assay.salesforge` can register a webhook.** Reading a workspace's webhooks, and creating
+  one, had no route in the module at all — so pointing a sequencer at a receiver stayed a thing
+  done by hand in the web app, and an instance whose registration was simply missing looked
+  exactly like one whose vendor had gone quiet. That is not a hypothetical: a live workspace was
+  found holding zero webhooks, which meant no reply, bounce or unsubscribe event had ever reached
+  its receiver.
+
+  `c:webhooks()` lists them, `c:webhook(id)` reads one, and `c:create_webhook{ url, event }`
+  registers one. Two things about the vendor are worth knowing before calling them. **A webhook
+  subscribes to exactly one event**, so replies and bounces and unsubscribes are three
+  registrations rather than one with three types. And **the signing secret comes back once, from
+  the create, and from nothing else** — a read never carries it, so a caller that does not store
+  it at creation can never verify a delivery afterwards.
+
+  `c:webhooks()` answers rows and a `meta` like every other list here. The tool caps at ten and
+  ignores `limit` and `offset` — the same shape `assay.forge` already handles for Primeforge — so
+  a full window reads as **truncated** rather than as a complete list that happens to be ten
+  long, and a workspace past ten does not lose rows in silence. A `url` or an `event` that is not
+  a string is refused where it was typed, because `tostring` on a table sends the vendor
+  `table: 0x…` as an event name and its refusal arrives a network hop later in words nobody can
+  act on.
+
+  These three ride the MCP endpoint rather than the REST API the rest of the module uses, because
+  the REST API has no webhooks route at any version: it answers 404. `assay.forge`'s JSON-RPC
+  caller already spoke to that endpoint, so it gained the Salesforge key header rather than a
+  second copy of the envelope handling.
+
+### Fixed
+
+- **A tool that refuses now reads as an error.** The MCP endpoint reports a tool's own refusal
+  inside an ordinary HTTP 200 result, flagged only by `isError`. `assay.forge`'s caller did not
+  look at that flag, so a refusal came back as a successful payload whose text happened to begin
+  "Error:" — and a caller acted on a call that had done nothing. It is a typed `tool` error now,
+  carrying the vendor's message.
+
+## assay-lua 0.20.6 — 2026-09-04
+
+### Added
+
+- **`assay.forge` and `assay.clayinbox` can provision, not only read.** Both modules could list
+  what a workspace holds and price it, and buy none of it, so every domain and mailbox was still
+  bought by hand.
+
+  Primeforge gains `p:buy_domain(domain, contact)`, `p:create_mailboxes(domain_id, boxes)` and
+  `p:app_password(id)`. `username` is the LOCAL PART and a full address is refused rather than
+  sent: the vendor accepts one silently and stores it doubled — `ada@brand.test@brand.test` — a
+  mailbox nothing can send from, which cannot be renamed and whose deletion tombstones the
+  address for days. A domain purchase charges a stored card and the registry refuses a partial
+  registrant, so the nine contact fields are checked before the call rather than after it.
+
+  Clayinbox gains `c:order(domain, boxes)`, `c:available(domain)`, `c:wallet()` and
+  `c:app_password(id)`. The order carries `import: true`, which is what makes it a BYO order
+  rather than one that also buys the domain, and it wants the FULL address where Primeforge wants
+  the local part — one keystroke apart, so a bare local part is refused, as is an address on
+  another domain.
+
+  Both `app_password` calls answer `not_ready` rather than an empty string. Clayinbox's endpoint
+  returns 200 with an empty record for some minutes after the box goes active, and Primeforge's
+  row carries no password until provisioning finishes; an empty string handed to an SMTP connect
+  is refused for a reason that has nothing to do with the real one.
+
+  Nothing here decides a price. `p:domain_price` and `c:available` are the quotes, and a caller
+  that has not shown one to somebody is buying blind.
+
+## assay-lua 0.20.5 — 2026-09-04
+
+### Added
+
+- **`assay.salesforge` can connect a mailbox and switch its warm-up on.** The module could read
+  what a workspace holds and what its warm-up is doing, and change neither. Wiring a fleet into
+  the sequencer therefore stayed a thing done by hand in the web app, seventeen boxes at a time.
+
+  `c:connect_smtp(address, password, opts)` posts the transport blocks the public API asks for —
+  one password carried into both, the address as the username on each, `smtp.gmail.com:587` and
+  `imap.gmail.com:993` unless `opts.smtp`/`opts.imap` say otherwise. The vendor verifies the
+  credentials afterwards, so what comes back is `pending` and `connected` is true only where the
+  vendor already said `active`: a caller that needs the verdict reads the box again rather than
+  being told a verification that has not happened yet succeeded. A 2xx carrying the vendor's own
+  refusal in the body — "failed to verify mailbox credentials" — is a typed `refused` error and
+  never a mailbox, because read as one it is a box nothing can send from, reported as connected.
+
+  `c:set_warmup(id_or_address, on)` sets the switch on the web app's own API and then **reads the
+  box back**. That is the point of it: a box created through the public API arrives with warm-up
+  off despite the vendor documenting that a connected box warms automatically, and a PUT that
+  answers 200 while the flag stays false is the failure this exists to catch. What comes back is
+  what the vendor now holds, not what it was asked for. An address is resolved to the vendor's id
+  on the internal listing, so an operator passes the address they actually have; anything without
+  an `@` is already an id, because the vendor's prefix has changed before.
+
+  `c:mailbox_internal(id)` and `c:mailbox_id(id_or_address)` are the two reads underneath, exposed
+  because a caller connecting a whole fleet needs both.
+
+## assay-lua 0.20.4 — 2026-09-04
+
+### Added
+
+- **`assay.email_triage` reads what a message says about itself.** `M.categorize` buckets by
+  matching a fixed keyword list against the subject and nothing else. Probed on 0.20.2 it misses a
+  keyword anywhere but the subject, and "unsubscribe please" lands in `needs_reply`, which is the
+  opposite of what it is. A reply-reading lane needs a pass that costs nothing and is not a guess,
+  so a message it can read never reaches a model at all.
+
+  `M.signals(msg)` takes `{headers, subject, text, html?}` and answers five independent readings —
+  `auto_reply`, `bounce`, `out_of_office`, `unsubscribe`, `referral` — each `{present, evidence}`
+  where the evidence is the header or the sentence that decided it. None of the five ranks the
+  others: a message can be an away notice that also asks to be left alone, and which of those wins
+  is the caller's policy rather than this module's. Every signal is in the answer whether or not it
+  fired, so `s.bounce.present` reads without a nil check first.
+
+  **Only the sender's own words are searched.** Cold outreach carries an unsubscribe line on every
+  send, and a reply quotes it underneath. Matched there, every reply anyone ever sends reads as
+  somebody asking to be left alone. `M.own_words` cuts at the first quote marker in four languages,
+  and at forty lines regardless. A client that quotes with no marker leaves a header block instead,
+  written in whatever language it runs in; that counts as a quote only where the sender line carries
+  an address and a second header follows it within four lines, so a reply opening "From: our end,
+  this looks fine" keeps everything it went on to say. The two word lists behind that are exported
+  as `M.HEADER_FROM_WORDS` and `M.HEADER_NEXT_WORDS`, and hold what Neutron's own reader holds. A
+  cut that would leave nothing found the whole message rather than a quote — a forward typed out by
+  hand — and keeps it. A bounce is the one exception and reads the whole body, because a delivery
+  report has no quoted reply to cut at.
+
+  **A return date with no year is the next occurrence of it.** Read as this year, a December message
+  naming January lands in the past and the follow-up goes out the same day, into an inbox nobody is
+  reading. A day that is today is today. A date the calendar does not have is no date at all, so "31
+  February" reads as nothing rather than rolling forward to the first of March.
+
+  **`List-Unsubscribe` is noted and never counted.** It is a header put on outbound mail, so a reply
+  quoting the letter carries it back; counted, every reply to a compliant campaign would read as an
+  opt-out. `Precedence: bulk` is reported the same way, beside the verdict rather than as one,
+  because bulk is what a mailing list sets and a person can write from a list.
+
+  English, German, French and Spanish, through `M.fold`: `string.lower` is byte-wise ASCII, so
+  "BÜRO" lowercases to something that never matches "buro". Both cases of every accented letter the
+  phrase lists use are folded, along with the curly apostrophe mail clients substitute silently. The
+  phrase lists are exported, so a caller adding a language extends them rather than forking the
+  reader.
+
+  `M.categorize` and `M.categorize_llm` are untouched and still exported. This is a function beside
+  them, not a replacement.
+
+## assay-lua 0.20.3 — 2026-09-04
+
+### Added
+
+- **The vendor modules report what the fleet costs, where the vendor will say.** A caller pricing a
+  mailbox fleet had to keep a price list beside these modules and trust it still matched what the
+  vendor was charging. Three of the four surfaces now answer for themselves; the fourth says
+  outright that it will not.
+
+  `assay.clayinbox` gains `c:costs()`. The price rides on the mailbox row — `cost` as a decimal
+  string, beside the cycle it repeats on — because every invoice, order and price path the vendor
+  might have put it behind answers 404. Rows sharing a price and a cycle collapse into one item, so
+  `quantity` means something, and the cycle is part of the grouping key: a yearly box never lands in
+  a monthly line at the same number. Only a live mailbox is billed: a box the vendor stopped
+  charging for inflates the bill with spend nobody is making, so a cancelled or suspended one is
+  counted in `meta.inactive`. A row whose status the vendor did not state at all is counted in
+  `meta.status_unknown` instead, because calling it inactive would report a cancellation nobody
+  made. Between them and `meta.unpriced`, every row that went unbilled says which of the three
+  reasons it was.
+
+  `assay.salesforge` gains `c:costs()`, off the web app's own `/me` — the only surface that carries
+  the plan at all. Every plan, billing, usage and limits path under the public workspace is a flat
+  404, and the internal subscription route answers "growth subscription not found" for an account
+  that never bought one. The vendor names no money anywhere on it, so the plan item carries no price
+  and `meta.priced` is false outright rather than letting an absent price read as free. `meta`
+  carries the plan's monthly ceilings and the credit pools beside them.
+
+  `assay.forge` gains `p:domain_price(domain)`, the only price either forge product answers. It
+  quotes registration for a year — a bought domain's `expiresAt` lands a year after its `createdAt`
+  — and says nothing about what the workspace is charged today. Neither product has a billing
+  endpoint, and the module description says so.
+
+- **`assay.vendor_cost`, the contract those three answer with.** One item shape and one money
+  conversion, so the three modules cannot drift apart on either.
+
+  An item is `{kind, unit, ref, quantity, unit_price_cents, period, source}`. `unit` is the unit of
+  measure — `"mailbox"`, `"domain"`, `"plan"` — and `ref` names the instance a line applies to,
+  which a line covering a group of them does not have. A price or a period the vendor never stated
+  is an absent key, never a zero: `meta.priced` says whether any line carries money at all, and
+  `meta.currency_known` is false on all three, because not one of these vendors states a currency
+  anywhere.
+
+  Money is whole cents, converted once. A fleet priced in floats accumulates a rounding error across
+  every row, and `19.99` landing at 1998 rather than 1999 is pinned by a test. `tonumber` reads
+  `"0x10"` as 16 and `"1e2"` as 100, so a price is digits with at most one decimal point and
+  anything else is counted as unpriced rather than billed at sixteen hundred cents.
+
+  A refused key reads as a typed error rather than as an empty item list. A costing that answers
+  "nothing" when the credential is wrong is the most expensive way this can fail, so 401, 402, 429
+  and 5xx each read as themselves, and a `/me` that is not an account object is a read error rather
+  than a workspace entitled to nothing.
+
+## assay-lua 0.20.2 — 2026-09-04
+
+### Added
+
+- **`assay.salesforge` can set a sequence's mailbox rotation and its status.** The two write calls
+  the sequencer seam needs and 0.20.1 left out. Without them the caller has to keep the vendor's
+  host name and its own HTTP client, which is the coupling these modules exist to remove.
+
+  `c:set_rotation(sequence_id, mailbox_ids)` replaces which mailboxes a sequence sends from, so a
+  caller taking one domain out of the rotation sends back the ids it means to keep.
+  `c:set_sequence_status(sequence_id, status)` takes `"paused"` or `"active"`. Both answer `(true)`
+  or `(nil, err)` like `c:enrol` and `c:dnc`, and `c:sequence(id)` already reads both back.
+
+  An empty rotation is a real instruction rather than an error. Pulling a paused domain's mailboxes
+  can leave a sequence with none, and that is the truthful state — it then cannot send, which is
+  what `c:set_sequence_status` is beside it for. Forcing the caller to keep one stale mailbox in the
+  rotation to express "none" would be worse. The ids are copied onto a table marked
+  `__jsontype = "array"` so an empty list reaches the vendor as `[]`; a bare Lua table would encode
+  as `{}` and be read as a malformed object. The copy keeps the marker off the caller's own table.
+
+  Two things are still refused before a request is made rather than after the vendor rejects one: a
+  blank sequence id, which would address the workspace itself, and any status outside the two the
+  vendor accepts, so a typo reads as a config error the caller can act on instead of a 400 it has to
+  interpret. A `mailbox_ids` that is not a table is refused for the same reason — it is not a list.
+
+## assay-engine 0.5.18 — 2026-09-04
+
+### Added
+
+- **`assay-engine migrate` moves a store from SQLite to Postgres.** The engine could be pointed at
+  either backend but never carried one to the other, so a deployment that outgrew its volume had to
+  start over. What it would have thrown away is not only workflow history: the same store holds the
+  auth module — users, password hashes, sessions, passkeys, JWT signing keys, OIDC clients, Zanzibar
+  tuples — and the vault, whose master KEK is a row in `vault.kek_metadata` rather than an
+  environment variable. Copying that row is what lets the ciphertext in `vault.kv` decrypt on the
+  other side, and a migration that moved the secrets without it would have produced a store that
+  looked intact and could not be read.
+
+  `--from sqlite:<data-dir> --to postgres://…` copies every table of every schema the engine owns,
+  preserving ids and timestamps, so a reference to a run still resolves afterwards. The table list
+  comes from `sqlite_master` and the Postgres catalog rather than from a list in the code, so a
+  module that adds a table is carried without an edit here. Generated-id sequences are re-pointed
+  past the copied rows, because rows that already own ids 1..N leave a sequence at 1 handing the
+  next write a collision.
+
+  A target that already holds engine rows is refused by name before anything is written: merging two
+  stores would have to reconcile ids that were only ever unique within one of them. A column the
+  source has and the target does not is an error rather than a silent drop; the reverse takes its
+  default. `--dry-run` prints the plan and the source's row counts and writes nothing. Both modes
+  print a row count per table. `engine.lock` is skipped and said so — SQLite serialises
+  single-instance access through that table where Postgres uses an advisory lock — as is any other
+  source table with no Postgres counterpart, reported with the rows it held.
+
+  Order of operations, and how to verify the result before keeping it, are in
+  [`docs/engine-store-migration.md`](docs/engine-store-migration.md).
+
+
+- **`ASSAY_VAULT_SEAL_KEY` encrypts the vault's master key at rest.** The KEK was stored as raw
+  bytes in `vault.kek_metadata`, so the row protecting every secret sat beside the secrets it
+  protects. On a volume that was one exposure; with the store in Postgres the nightly dump becomes
+  a plaintext copy of the whole vault, and so does every backup of it.
+
+  Set the variable to any string of at least 32 characters and the KEK is sealed with
+  AES-256-GCM-SIV instead — a version byte, a nonce, and the encrypted key, with the key id as
+  additional authenticated data so a blob copied onto another row does not open. The cipher key is
+  derived from the value with SHA-256 over a fixed label rather than decoded from it, so base64,
+  hex and a passphrase all work and nothing depends on the encoding a chart happens to emit.
+  A store already holding a plaintext KEK is
+  re-sealed in place on the first boot that has the key, which makes turning it on a restart rather
+  than a migration, and logs that backups taken before then still hold the unsealed key. Re-running
+  is a no-op. Rotation keeps the sealing rather than writing the next KEK in the clear.
+
+  Losing the key is not recoverable, so a sealed store with the wrong key or none at all refuses to
+  start rather than minting a fresh KEK and orphaning every secret the old one wraps. Without the
+  variable behaviour is exactly as before, warning as it always did.
+  [`docs/vault-sealing.md`](docs/vault-sealing.md) covers the trade and the failure modes.
+
+### Fixed
+
+- **The engine no longer takes tables it did not create.** Its v0.13.1 upgrade step ran on every
+  boot and moved `public.workflows` and `public.namespaces` into the `workflow` schema, and dropped
+  `public.api_keys` with `CASCADE`, on nothing more than the names matching. Pointed at a database
+  a host application also uses, it took that application's tables: 30 rows and their own columns
+  relocated under the engine, the application's reads failing with `relation "public.workflows"
+  does not exist`, and `public.api_keys` gone for good. The engine broke too, since the tables it
+  had adopted were not the shape it expected. `ALTER TABLE ... SET SCHEMA` is not undone by
+  reverting a deploy.
+
+  The move now requires proof the tables are the engine's own. `public.workflow_events` is the
+  marker — every v0.13.1 store has it, no application is holding a table by that name, and it moves
+  in the same transaction as the rest. Without it nothing moves. With it, the two ambiguously named
+  tables must also carry the columns the engine's own versions always had. Anything failing either
+  check is left alone and named in the log, and `public.api_keys` is now reported rather than
+  dropped, because an orphaned table costs nothing and an unrecoverable drop does not.
+
+  Run the engine in its own database regardless. It owns four schemas, and the default config
+  example says so.
+
+
+- **Engines starting together on an empty Postgres no longer kill each other.**
+  `CREATE ... IF NOT
+  EXISTS` is not atomic: Postgres runs the existence check before the catalog
+  insert, so two engines booting at the same instant both passed the check and one lost with
+  `duplicate key value violates
+  unique constraint "pg_type_typname_nsp_index"` — or
+  `pg_namespace_nspname_index` for a schema — and exited instead of serving. Ten engines started
+  together on a fresh database lost nine.
+
+  The engine-core schema had already been serialised behind `pg_advisory_xact_lock`, and its doc
+  comment named this exact behaviour, but the auth, vault and workflow migrations and the engine's
+  own `CREATE SCHEMA` loop each ran their DDL outside it. All four now take the same
+  transaction-scoped advisory lock, so concurrent boots serialise rather than race. Transaction
+  scope means commit, rollback and a dropped connection all release it, so a migration that dies
+  cannot strand the lock. A schema setup that still loses a catalog race — a caller reaching
+  Postgres without the lock — retries instead of failing, on the three codes the catalog raises for
+  it. A test boots ten engines at once on a fresh database, five times over.
+
+## assay-workflow 0.4.7 — 2026-09-04
+
+### Fixed
+
+- Postgres schema migration runs inside one advisory-locked transaction, so concurrent first boots
+  serialise their DDL instead of racing `CREATE TABLE IF NOT EXISTS` and losing one caller to a
+  catalog unique violation, and retries when it loses one anyway.
+- The v0.13.1 relocation moves a table only once the database proves it is the engine's own, and
+  reports rather than drops the retired `public.api_keys`.
+
+## assay-auth 0.6.3 — 2026-09-04
+
+### Fixed
+
+- Same advisory lock around `schema::migrate_postgres`. The `backend-postgres` feature now also
+  enables `assay-domain/backend-postgres`, which it had always needed transitively.
+
+## assay-vault 0.4.4 — 2026-09-04
+
+### Added
+
+- `crypto::env_seal` seals the master KEK under a key derived by SHA-256 from an environment
+  string of at least 32 characters, and
+  `kek_store::load_or_init_*_sealed` load, re-seal and refuse accordingly. `SealingMethod::EnvKey`
+  and `VaultCtx::with_kek_method` carry the method through to `/sys/seal-status`, which reported
+  every store as plaintext before.
+
+### Fixed
+
+- Same advisory lock around `schema::migrate_postgres`, and the same `backend-postgres` feature fix.
+
+## assay-domain 0.2.5 — 2026-09-04
+
+### Added
+
+- `engine::SCHEMA_MIGRATION_LOCK` and `engine::acquire_schema_lock`, the one advisory-lock id every
+  Postgres schema migration in the workspace holds while it runs DDL. Modules share one id rather
+  than taking their own because they share the `CREATE SCHEMA` statements even where their tables
+  are disjoint. `engine::retry_ddl` re-runs a migration that lost a catalog race regardless.
+
+## assay-lua 0.20.1 — 2026-09-04
+
+### Added
+
+- **`assay.clayinbox`, `assay.forge` and `assay.salesforge` — the cold-email vendor stack as stdlib
+  modules.** The logic had been living twice: once in an ops script that reads OpenBao itself, and
+  once in a TypeScript adapter inside one product. Neither is reachable from an agent that bakes
+  assay modules as tools. All three take their credentials from the caller (`opts`, or a documented
+  environment variable) and read no secret store, so the same module serves a script, a service and
+  an agent.
+
+  `assay.clayinbox` lists the domains a workspace holds and the mailboxes on them, paged to the
+  last row. `assay.forge` speaks the shared forge MCP endpoint for both Primeforge and Warmforge —
+  domains, mailboxes, warm-up position, placement tests and the DNS health report. `assay.salesforge`
+  covers the public REST API (workspaces, mailboxes, sequences, contacts, do-not-contact, replies)
+  and the web app's own Firebase-authenticated API, which is the only place the warm-up state
+  appears.
+
+  Six vendor behaviours are pinned by tests because each one has already cost someone a wrong
+  answer. A Primeforge domain arrives as `sld` and `tld` and never as a whole name, so a reader
+  looking for one finds no domains at all. A Warmforge health check the report omits is `unknown`
+  and never `invalid`, because reading an omitted check as a failure tells an operator a record
+  they published is missing. Warm-up length is the sum of the days done and the days left rather
+  than a constant kept in step with the vendor's. A placement row carrying no folder counts is a
+  test nobody ran, not a placement of zero. The Salesforge public key rides bare in `Authorization`
+  — an apiKey scheme, not a bearer one — and a workspace with no sequences answers with a JSON
+  object where a list belongs. Auth, rate limiting, the Growth-plan gate and a Cloudflare block page
+  served under an HTTP 200 all read as themselves rather than as an empty fleet.
+
+  Errors are returned, not thrown: every vendor call answers `(result)` or `(nil, err)` where `err`
+  carries `code`, `status` and `message` and prints as its message. The constructors are the
+  exception and throw, matching the rest of the stdlib — a client built without a key or a
+  workspace is a programming error rather than a vendor answer. `raw` on a mapped row is the
+  vendor's own record with credentials removed, since both Clayinbox and Primeforge put a mailbox
+  password on a list row.
+
+  Every list call also answers a second value, `meta = {truncated, cap, seen}`. `truncated` means a
+  cap stopped the walk rather than the vendor running out of rows, so no list can come back short in
+  silence. It matters most on Primeforge, where a domain filter is applied to a ten-row window: an
+  empty result there means either that the domain has no mailboxes or that its mailboxes fall
+  outside the window, and only `meta` tells the two apart.
+
+  One limit is the vendor's rather than the module's: `primeforge_list_mailboxes` accepts
+  `workspaceId` and nothing else, and answers ten rows whatever `limit` and `offset` say — offset 10
+  and offset 20 return the same ten ids. A workspace holding more than ten mailboxes cannot be
+  listed in full through that tool, so `p:mailboxes(domain_id)` filters what the vendor gives rather
+  than sending a filter the tool would ignore.
+
+## assay-engine 0.5.17 — 2026-09-03
+
+### Fixed
+
+- **0.5.16 exited at startup on every store created by an earlier engine.** The baseline schema
+  created the `events.activity_id` index before the migration added the column, so an existing
+  database failed on `no such column: activity_id` (SQLite) or `column "activity_id" does not
+  exist` (Postgres) and the engine never came up. Fresh databases were unaffected, which is why the
+  release tests passed. The index is now created after the column, and a schema-upgrade test opens
+  both stores on a pre-0.5.16 database.
+
+## assay-engine 0.5.16 — 2026-09-03
+
+### Fixed
+
+- **Activity completion is one transaction: the row, the history event, and the workflow task.** The
+  engine wrote those three separately, so a slow disk could land the first and lose the rest —
+  `POST /tasks/{id}/complete` returned 200, the activity read `COMPLETED` with its result, and the
+  workflow's history showed the activity still scheduled. A deterministic workflow replays that
+  history, waits on an activity that already finished, and stays `RUNNING` forever. In the reported
+  case the only recovery was to re-post the identical completion by hand.
+
+  `WorkflowStore::settle_activity` now applies all three in one transaction, so `COMPLETED` without
+  the matching event is unreachable rather than unlikely. It is idempotent, which makes re-posting a
+  completion the documented repair path: an activity whose event is already durable re-arms the
+  dispatch flag and appends nothing, recovering a workflow task lost after the event landed — the
+  second shape the same disk produced. Signal delivery closes the same way: the signal row, its
+  `SignalReceived` event and the dispatch arming commit together, since a stored signal the workflow
+  cannot see is a run that waits on nothing.
+
+  Rows already half-settled by an earlier engine still needed a way out, so the health monitor now
+  re-settles them on its next pass. `workflow.events` carries an `activity_id` column to make "did
+  this activity's terminal event land" an indexed question rather than a scan of payload JSON;
+  existing terminal events are backfilled from their payloads at startup.
+
+- **A worker whose registration was reaped now registers again instead of polling a dead id.**
+  Heartbeating an id the reaper had already removed answered `200`, so the worker kept polling under
+  a registration no queue dispatched to until someone restarted the process — observed as a worker
+  that went missing for thirty minutes and came back only on a pod restart. The endpoint answers
+  `404` when the row is gone, and the Lua worker re-registers on it.
+
+## assay-lua 0.20.0 — 2026-09-02
+
+### Added
+
+- **`dns` builtin — the record types `getaddrinfo` cannot ask for.** `dns.lookup(name, type, opts?)`
+  answers `A`, `AAAA`, `CNAME`, `MX`, `NS` and `TXT`, with `opts.{server, timeout_ms, tries}`;
+  `dns.dnsbl(domain, list, opts?)` asks a blacklist about a domain. Domain health was the case that
+  forced it — MX, SPF, DKIM, DMARC and blacklist hits are all questions the stub resolver has no way
+  to put — and it had been living in a bash script around `dig`, which cannot run inside an agent
+  that bakes assay modules. `examples/domain-health.lua` is that script, ported.
+
+  Three decisions in it are load-bearing rather than incidental. A `TXT` record's 255-byte chunks
+  are rejoined with nothing between them, because they are one value the wire format had to cut up
+  and a separator corrupts every DKIM key long enough to need two of them. `NXDOMAIN` is an empty
+  list while `SERVFAIL`, `REFUSED` and timeouts raise, because "nothing lists this domain" and
+  "nobody answered" look identical once failures collapse into an empty result, and they mean
+  opposite things to whoever is about to send mail. And `127.255.255.0/24` does **not** count as a
+  DNSBL listing: Spamhaus and SURBL return it to resolvers they do not serve, so reading it as a hit
+  marks every domain checked as blacklisted. It is still reported in `codes`, so a caller can tell
+  "not listed" from "not allowed to ask".
+
+  The protocol is spoken directly over UDP with TCP fallback rather than through a resolver crate —
+  no new dependency, and the wire format's awkward parts (chunk joining, MX ordering, RCODE meaning,
+  compression-pointer loops) are unit-testable as pure functions. Compression pointers must point
+  strictly backwards, so a self-referential message errors instead of hanging. Queries carry an
+  EDNS0 buffer of 1232 bytes, since the classic 512-byte limit truncates ordinary DKIM keys.
+
+  Nameservers come from `/etc/resolv.conf` in the order it lists them, with no public fallback: a
+  script that believes it is asking the corporate resolver should not silently ask someone else's.
+  `opts.server` overrides that, and is refused outright when a policy is installed — a caller-chosen
+  resolver is a directed egress channel, since a restricted script could carry data out in the names
+  it looks up. Resolution through the system resolver stays unbounded, though: a policy has no
+  allowlist of names, so a policed script can still reach an authoritative server of its choosing by
+  looking up a name under it. `docs/policy.md` says so under **DNS** rather than leaving it to be
+  discovered.
+
+## assay-lua 0.19.2 — 2026-08-28
+
+### Added
+
+- **`assay.companies_house` — the UK register, and the first free source that still needs a key.**
+  Company search, full profiles, and the officers a profile does not name — which is the reason to
+  reach a registry for outreach at all, since the profile names the company and the officer list
+  names the person to write to. The key is free but issued per caller, so the client refuses to
+  construct without one rather than failing later with a `401` that reads like an outage; the key is
+  the Basic username with an empty password, and the trailing colon is load-bearing. Search hits and
+  company profiles describe the same entity under different names — `title`/`company_name`,
+  `company_type`/`type`, `address`/`registered_office_address` — and both are read, because reading
+  one set yields a record with a nil name from the other endpoint. Twelve registry statuses bucket
+  into the three the other registry modules answer in; a status the registry adds later is
+  upper-cased rather than mapped to `ACTIVE`, which would be the one wrong answer.
+- **`assay.mails_so` — the paid verify_email rung.** One GET per address through the budget gate.
+  The vendor's "deliverable" lands as PROBABLE, never VERIFIED — only our own evidence verifies —
+  and a domain that accepts anything is CATCH_ALL whatever the vendor concluded. Raw verdict, score,
+  MX and reason ride along on the record. Gated live smoke arms itself when `MAILS_SO_KEY` is
+  present.
+
+### Changed
+
+- **`assay.gleif` and `assay.edgar` now answer in the shared company shape.** They predated
+  `lead_provider.company` and carried a hand-rolled provenance with no `retrieved_at`, so a fact
+  from the two oldest registry modules was not interchangeable with one from `brreg`, `cvr` or
+  `companies_house` — which is the whole claim of NEP-0007 §10. Both now normalize through the
+  shared constructor. `edgar:find` returns company records rather than raw index rows; `tickers()`
+  stays a lightweight index, since stamping ten thousand rows individually buys nothing.
+
+### Fixed
+
+- **Three field mappings that only a live response could disprove**, all found by running the
+  modules against the real APIs rather than against their own fixtures:
+  - `assay.gleif` cited Equinor's Norwegian number as `923 609 016` where Brreg holds `923609016`.
+    Unstripped, the two registries never joined on the company they both describe — which was the
+    entire point of putting a national `registry_id` on a GLEIF record.
+  - `assay.edgar` read a domestic filer's `stateOrCountry` as the country, turning Apple's
+    California into `CA` — indistinguishable from Canada. EDGAR states no country for domestic
+    filers and inverts the fields for foreign ones, so the two cases are now read separately.
+  - `assay.edgar` reported CIK `320193` from the ticker index and `"0000320193"` from submissions,
+    handing out two identities for one company and breaking any join between its own two surfaces.
+    It also passed EDGAR's empty-string `website` straight through as a blank domain claim.
+
+- **`assay.brreg` and `assay.cvr` — worldwide reach starts with the registries that are actually
+  open.** Norway's Enhetsregisteret and Denmark's CVR are keyless, and Brreg publishes two things
+  most national registries do not: the company website and a live employee count. That makes
+  `by_website` possible — _which legal entity owns this domain_ — which is the join a prospect list
+  actually needs, since the list holds domains and the registry holds companies. Normalisation
+  carries the weight: Norway's three distress booleans collapse to one status, an unreported
+  headcount stays absent rather than becoming zero, Denmark's `04/12 - 2013` becomes an ISO date,
+  and a website registered as `https://WWW.X.no/` reduces to a joinable host. `lead_provider` grows
+  a shared `company` shape, so a registry fact and a bought fact differ only by provenance (NEP-0007
+  §10).
+
+- **Live smoke tests for the paid lead providers.** Gated on a key being present, so they skip
+  everywhere a key is absent and the suite stays green. They check the half a fixture cannot: that
+  the vendor still sends the fields the adapter reads. That mattered once already — BetterContact's
+  verdict field was wrong, and no fixture could catch it because the fixture carried the same
+  mistake. One of them proves a declined budget stops a call against the real API rather than a
+  mock.
+
+- **`assay.bettercontact` read the wrong field for the email verdict.** The vendor's field is
+  `contact_email_address_status`, not `contact_email_status`, and its deliverable value is
+  `deliverable`, not `valid` — `valid` is a counter in the summary object, not a per-contact
+  verdict. Reading the wrong name yielded nil, which mapped to UNKNOWN, and UNKNOWN never schedules
+  under NEP-0007 §2 — so every enriched address came back silently unusable rather than visibly
+  broken. The full documented enum is now covered, `catch_all_safe` stays CATCH_ALL rather than
+  being promoted on the vendor's say-so, and the raw verdict rides along as `vendor_status` so the
+  nuance survives without laundering.
+
+- **`assay.lead_provider`, `assay.contactout`, `assay.bettercontact` — paid lookups get a gate they
+  cannot walk around.** The contract module carries the uniform person/email shapes with provenance,
+  so free registry facts and bought ones read identically downstream, and it owns the budget gate:
+  the spend ledger lives in the caller's database, so the context is injected, and a client cannot
+  be constructed without one. A declined budget means the provider is never called, and a call that
+  raised is never metered — the ledger answers what things cost, and a failed call bought nothing.
+  ContactOut wants the bare `token` header (not Authorization, no Bearer). BetterContact is
+  asynchronous and answers 202 with no data while a run is still going, so only its own `terminated`
+  status counts as finished. Neither adapter can promote a vendor's claim to VERIFIED; `valid` means
+  PROBABLE, because an assertion is not a delivery.
+
+- **`smtp_probe` — email verification finishes inside the binary.** The rung above DNS is now a
+  compiled builtin rather than a service to run or a vendor to pay: connect, greeting, EHLO (falling
+  back to HELO), MAIL FROM, a random-address RCPT that exposes catch-alls, the target RCPT, QUIT.
+  DATA is never issued, so a probe cannot deliver anything. `email_verify` grows a `probe()` that
+  turns those replies into NEP-0007's vocabulary — PROBABLE for an accepted recipient, CATCH_ALL for
+  a host that accepts anyone, INVALID only when a server names the mailbox as absent — plus
+  disposable, role and typo signals carried as flags, never as a status, because INVALID is
+  permanent and a shortlist can be wrong. An accepted RCPT stops at PROBABLE on purpose: servers
+  accept at RCPT and bounce afterwards. The cost is tens of KB on networking already in the binary,
+  and the one-binary story is intact.
+
+- **`assay.email_verify` — the waterfall's free rung.** Syntax that refuses what could never
+  deliver, MX lookups over DNS-over-HTTPS (keyless, deterministic, one mock in tests), and the
+  pattern candidates an executive address usually takes. Its vocabulary is deliberately capped at
+  INVALID and UNKNOWN — the statuses that let a pipeline reject cheaply without ever inflating free
+  evidence into a send-safe verdict.
+
+- **`assay.gleif` and `assay.edgar` — the first registry modules.** Company discovery kept paying
+  (or scraping) for facts that sit in open registries. GLEIF answers "does this legal entity exist,
+  where, under what status" for every jurisdiction with no key at all; EDGAR answers the US
+  public-company half — tickers, SIC, addresses, filings, full-text search — behind nothing but an
+  identifying User-Agent, which the client refuses to run without. Both normalize to one flat
+  registry shape and stamp provenance on every record, so a fact fetched here stays auditable
+  wherever it flows.
+
 ## assay-engine 0.5.15 — 2026-08-20
 
 ### Changed

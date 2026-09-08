@@ -81,6 +81,7 @@ impl ShareSubmission {
 #[non_exhaustive]
 pub struct SealState {
     inner: Arc<RwLock<SealStateInner>>,
+    operation_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl SealState {
@@ -99,6 +100,7 @@ impl SealState {
                 kek_digest: None,
                 pending_activation: false,
             })),
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -128,13 +130,15 @@ impl SealState {
                 kek_digest: Some(kek_digest),
                 pending_activation: false,
             })),
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
     /// Drop the in-memory KEK; future ops fail with [`VaultError::Sealed`].
     /// For Shamir-method state, primes a fresh accumulator for the next
     /// unseal.
-    pub fn seal(&self) -> Result<()> {
+    pub async fn seal(&self) -> Result<()> {
+        let _exclusive = self.begin_rotation().await;
         let mut g = self.inner.write();
         g.handle = None;
         g.pending_activation = false;
@@ -166,6 +170,21 @@ impl SealState {
     pub fn require_unsealed(&self) -> Result<KekHandle> {
         let g = self.inner.read();
         g.handle.clone().ok_or(VaultError::Sealed)
+    }
+
+    /// Hold a shared permit while a service uses the returned KEK through
+    /// its database operation. Rotation takes the exclusive permit so the
+    /// handle and persisted `kek_kid` cannot diverge.
+    pub(crate) async fn begin_operation(
+        &self,
+    ) -> Result<(tokio::sync::OwnedRwLockReadGuard<()>, KekHandle)> {
+        let permit = self.operation_gate.clone().read_owned().await;
+        let handle = self.require_unsealed()?;
+        Ok((permit, handle))
+    }
+
+    pub(crate) async fn begin_rotation(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.operation_gate.clone().write_owned().await
     }
 
     /// Submit one Shamir unseal share. Returns the new
@@ -382,16 +401,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsealed_round_trip() {
+    #[tokio::test]
+    async fn unsealed_round_trip() {
         let kek = random_dek();
         let handle = KekHandle::from_bytes("kek-test", kek);
         let s = SealState::unsealed(SealingMethod::Plaintext, "kek-test".into(), handle);
         assert!(!s.status().sealed);
         let _h = s.require_unsealed().unwrap();
-        s.seal().unwrap();
+        s.seal().await.unwrap();
         assert!(s.status().sealed);
         assert!(matches!(s.require_unsealed(), Err(VaultError::Sealed)));
+    }
+
+    #[tokio::test]
+    async fn seal_waits_for_rotation_state_swap_and_remains_sealed() {
+        let old = KekHandle::from_bytes("kek-old", random_dek());
+        let state = SealState::unsealed(SealingMethod::Plaintext, "kek-old".into(), old);
+        let rotation = state.begin_rotation().await;
+
+        let sealing_state = state.clone();
+        let sealing = tokio::spawn(async move { sealing_state.seal().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !sealing.is_finished(),
+            "seal must wait for rotation's database commit and state swap"
+        );
+
+        let new = KekHandle::from_bytes("kek-new", random_dek());
+        state.set_unsealed("kek-new".into(), new);
+        drop(rotation);
+        sealing.await.unwrap().unwrap();
+
+        assert!(state.status().sealed);
+        assert_eq!(state.status().kid.as_deref(), Some("kek-new"));
+        assert!(matches!(state.require_unsealed(), Err(VaultError::Sealed)));
     }
 
     #[test]
@@ -486,8 +529,8 @@ mod tests {
         assert!(state.status().sealed);
     }
 
-    #[test]
-    fn seal_clears_handle_and_resets_accumulator() {
+    #[tokio::test]
+    async fn seal_clears_handle_and_resets_accumulator() {
         let kek = random_dek();
         let shares = split_kek(&kek, 3, 5).unwrap();
         let kid = crate::crypto::kek::mint_kid(&kek);
@@ -497,7 +540,7 @@ mod tests {
             submit(&s, sh.as_bytes().to_vec()).unwrap();
         }
         assert!(!s.status().sealed);
-        s.seal().unwrap();
+        s.seal().await.unwrap();
         assert!(s.status().sealed);
         assert_eq!(s.status().shares_progress, 0);
     }

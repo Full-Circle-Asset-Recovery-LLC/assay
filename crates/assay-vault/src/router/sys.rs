@@ -131,7 +131,7 @@ where
     S: Clone + Send + Sync + 'static,
     VaultCtx: FromRef<S>,
 {
-    if let Err(e) = vault.seal_state.seal() {
+    if let Err(e) = vault.seal_state.seal().await {
         return vault_err_to_response(e);
     }
     let kid = vault.seal_state.status().kid;
