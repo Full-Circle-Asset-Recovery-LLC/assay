@@ -9,7 +9,7 @@
 //! parsing → backend connect → migrations → axum compose → router
 //! serving → both workflow API and dashboard paths answering.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -32,6 +32,7 @@ fn engine_binary() -> PathBuf {
 struct EngineProcess {
     child: Child,
     port: u16,
+    stderr_path: PathBuf,
     _tmpdir: tempfile::TempDir,
 }
 
@@ -41,12 +42,19 @@ impl EngineProcess {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private tempdir");
-        let data_dir = tmp.path().join("data");
+        // macOS commonly returns /var/folders/... for temporary directories,
+        // while /var is a symlink to /private/var. The engine deliberately
+        // rejects non-canonical SQLite parents, so configure it with the
+        // canonical temporary root just as a production config must be.
+        let tmp_root = tmp.path().canonicalize().expect("canonical tempdir");
+        let data_dir = tmp_root.join("data");
         std::fs::create_dir(&data_dir).expect("data dir");
         std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
             .expect("private data dir");
         let db_path = data_dir.join("engine.db");
-        let cfg_path = tmp.path().join("engine.toml");
+        let cfg_path = tmp_root.join("engine.toml");
+        let stderr_path = tmp_root.join("engine.stderr");
+        let stderr = std::fs::File::create(&stderr_path).expect("create engine stderr log");
 
         let cfg = format!(
             r#"
@@ -74,13 +82,14 @@ format = "pretty"
             .arg(&cfg_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn engine");
 
         Self {
             child,
             port,
+            stderr_path,
             _tmpdir: tmp,
         }
     }
@@ -89,7 +98,17 @@ format = "pretty"
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
 
-    async fn wait_ready(&self, client: &reqwest::Client) {
+    fn stderr_diagnostic(&self) -> String {
+        let mut bytes = Vec::new();
+        match std::fs::File::open(&self.stderr_path)
+            .and_then(|file| file.take(16 * 1024).read_to_end(&mut bytes))
+        {
+            Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("<failed to read engine stderr: {error}>"),
+        }
+    }
+
+    async fn wait_ready(&mut self, client: &reqwest::Client) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(r) = client
@@ -100,8 +119,18 @@ format = "pretty"
             {
                 return;
             }
+            if let Some(status) = self.child.try_wait().expect("inspect engine process") {
+                let stderr = self.stderr_diagnostic();
+                panic!("engine exited before ready with {status}: {stderr}");
+            }
             if Instant::now() >= deadline {
-                panic!("engine did not become ready on port {}", self.port);
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let stderr = self.stderr_diagnostic();
+                panic!(
+                    "engine did not become ready on port {}: {stderr}",
+                    self.port
+                );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -120,7 +149,7 @@ async fn engine_smoke_sqlite() {
     // Log to stderr so test output shows the port if anything fails.
     let _ = writeln!(std::io::stderr(), "engine_smoke_sqlite starting");
 
-    let engine = EngineProcess::spawn();
+    let mut engine = EngineProcess::spawn();
     let client = reqwest::Client::builder()
         // 30s — generous: Argon2id (m=64 MiB, t=3, p=4) on a slow CI
         // runner can take 2-3s per hash; the BW register/verify path
