@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 #
-# Usage: extract-changelog.sh <version>
-#
-# Prints the markdown body of the CHANGELOG.md section for the given version.
-# Reads CHANGELOG.md from the repo root (current working directory when invoked
-# by GitHub Actions). The section runs from the `## [<version>]` heading up to
-# (but not including) the next `## [` heading.
-#
-# Exits 0 on success, 1 if the version isn't found in the changelog.
+# Usage: extract-changelog.sh "<component> <version>"
+# Reads the exact plain or bracketed H2 section from CHANGELOG.md in the
+# current directory. Bare version selectors support legacy bracketed headings.
+# Exits nonzero when no nonempty matching section exists.
 
 set -euo pipefail
 
@@ -19,15 +15,19 @@ if [ ! -f "$changelog" ]; then
     exit 1
 fi
 
-# `## [x.y.z]` is the section anchor. String-prefix matching (no regex) sidesteps
-# awk's escape-sequence warnings and still safely distinguishes `0.1.0` from
-# `0.1.10` because we check both the prefix AND the character immediately after
-# the version (which must be `]`).
-anchor="## [${version}]"
+# Match the whole selector, allowing a date suffix separated by whitespace.
+# Component selectors never fall back to unrelated bare version headings.
+anchor="## ${version}"
+bracketed="## [${version}]"
 
-body=$(awk -v anchor="$anchor" '
-    index($0, anchor) == 1 { in_section = 1; next }
-    in_section && index($0, "## [") == 1 { exit }
+body=$(awk -v anchor="$anchor" -v bracketed="$bracketed" '
+    function matches(line, prefix, suffix) {
+        if (index(line, prefix) != 1) return 0
+        suffix = substr(line, length(prefix) + 1)
+        return suffix == "" || suffix ~ /^[[:space:]]/
+    }
+    in_section && $0 ~ /^##([[:space:]]|$)/ { exit }
+    matches($0, anchor) || matches($0, bracketed) { in_section = 1; next }
     in_section { print }
 ' "$changelog")
 

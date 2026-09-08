@@ -507,6 +507,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Release changelog regression tests
+        run: python3 .github/release/test_extract_changelog.py
+
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/deploy.yml
 

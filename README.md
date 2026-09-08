@@ -350,7 +350,7 @@ env from a Secret:
 spec:
   containers:
     - name: engine
-      image: ghcr.io/developerinlondon/assay-engine:0.3.1
+      image: ghcr.io/developerinlondon/assay-engine:0.6.0
       args: ["serve", "--config", "/etc/assay/engine.toml"]
       env:
         - name: DATABASE_URL
