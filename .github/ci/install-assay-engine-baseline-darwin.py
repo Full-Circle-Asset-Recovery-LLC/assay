@@ -22,13 +22,16 @@ def fail(message: str) -> NoReturn:
 
 
 def github_json(url: str) -> dict[str, Any]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "assay-baseline-installer",
+    }
+    if token := os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "assay-baseline-installer",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
@@ -109,7 +112,7 @@ def main() -> None:
             "Darwin baseline release tag does not resolve to its attested source commit"
         )
 
-    payload = download(asset["url"], artifact["size_bytes"])
+    payload = download(asset["browser_download_url"], artifact["size_bytes"])
     if len(payload) != artifact["size_bytes"]:
         fail("Darwin baseline byte length differs from its attestation")
     if hashlib.sha256(payload).hexdigest() != artifact["sha256"]:

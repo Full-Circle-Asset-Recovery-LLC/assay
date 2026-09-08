@@ -249,6 +249,8 @@ jobs:
 
       - name: Install pinned assay-engine v0.5.15 baseline (macOS)
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'macOS'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           baseline=$(python3 .github/ci/install-assay-engine-baseline-darwin.py "$RUNNER_TEMP/assay-baseline")
           echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"
