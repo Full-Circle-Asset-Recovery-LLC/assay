@@ -562,13 +562,16 @@ async fn offline_init_shamir(
         .anchored_data_dir()
         .unwrap_or_else(|| configured_data_dir.to_path_buf());
     let data_dir_path = anchored_data_dir.as_path();
-    validate_checkpointed_sqlite_generation(data_dir_path)?;
-    let output = AnchoredOutput::open(shares_out)?;
+    validate_checkpointed_sqlite_generation(data_dir_path)
+        .context("validate checkpointed SQLite generation")?;
+    let output = AnchoredOutput::open(shares_out).context("anchor Shamir output directory")?;
     #[cfg(debug_assertions)]
     maybe_pause_after_output_anchor()?;
-    let recovery_journal = read_transition_journal(&output)?;
+    let recovery_journal =
+        read_transition_journal(&output).context("read Shamir transition journal")?;
     let backup_receipt =
-        validate_backup_manifest(backup_manifest, data_dir_path, recovery_journal.is_none())?;
+        validate_backup_manifest(backup_manifest, data_dir_path, recovery_journal.is_none())
+            .context("validate rollback backup manifest")?;
     let engine_path = data_dir_path.join("engine.db");
     let vault_path = data_dir_path.join("vault.db");
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.create_if_missing(false);
