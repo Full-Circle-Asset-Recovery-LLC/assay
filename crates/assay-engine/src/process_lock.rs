@@ -57,7 +57,9 @@ impl RuntimeTaskGuard {
 pub struct ProcessLock {
     _file: File,
     #[cfg(unix)]
-    data_dir: File,
+    _data_dir: File,
+    #[cfg(unix)]
+    anchored_data_dir: std::path::PathBuf,
 }
 
 impl ProcessLock {
@@ -257,6 +259,39 @@ impl ProcessLock {
     }
 
     #[cfg(unix)]
+    fn anchored_data_dir_unix(dir: &File) -> anyhow::Result<std::path::PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        #[cfg(target_os = "macos")]
+        let anchored = {
+            let metadata = dir
+                .metadata()
+                .context("inspect anchored SQLite data directory")?;
+            // Darwin's volfs compatibility path resolves the held directory by
+            // volume and file ID, so descendants remain bound across renames.
+            let volume_id = metadata.dev() as libc::dev_t;
+            std::path::PathBuf::from(format!("/.vol/{volume_id}/{}", metadata.ino()))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let anchored = {
+            use std::os::fd::AsRawFd;
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        };
+
+        let reopened = File::open(&anchored).with_context(|| {
+            format!("open anchored SQLite data directory {}", anchored.display())
+        })?;
+        let expected = dir.metadata().context("inspect SQLite data directory")?;
+        let actual = reopened
+            .metadata()
+            .context("inspect reopened anchored SQLite data directory")?;
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            anyhow::bail!("anchored SQLite data directory identity mismatch");
+        }
+        Ok(anchored)
+    }
+
+    #[cfg(unix)]
     fn acquire_unix(data_dir: &Path) -> anyhow::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -296,17 +331,18 @@ impl ProcessLock {
                 data_dir.display()
             )
         })?;
+        let anchored_data_dir = Self::anchored_data_dir_unix(&dir)?;
         Ok(Self {
             _file: file,
-            data_dir: dir,
+            _data_dir: dir,
+            anchored_data_dir,
         })
     }
 
     pub fn anchored_data_dir(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
-            Some(format!("/proc/self/fd/{}", self.data_dir.as_raw_fd()).into())
+            Some(self.anchored_data_dir.clone())
         }
         #[cfg(not(unix))]
         {
