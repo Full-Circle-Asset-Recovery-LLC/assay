@@ -53,6 +53,7 @@ scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
 archive="$scratch/$asset_name.gz"
 curl --fail --silent --show-error --location \
+  --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
   "https://raw.githubusercontent.com/$repository/$fixture_commit/$fixture_path" >"$archive"
 
 actual_gzip_size="$(wc -c <"$archive" | tr -d '[:space:]')"
@@ -89,7 +90,7 @@ destination="$(mkdir -p "$1" && cd "$1" && pwd -P)"
 chmod 0700 "$destination"
 installed="$destination/assay-engine-v0.5.15"
 install -m 0500 "$download" "$installed"
-actual_version="$($installed --version)"
+actual_version="$("$installed" --version)"
 if [[ "$actual_version" != "$expected_version" ]]; then
   echo "baseline version mismatch: expected '$expected_version', got '$actual_version'" >&2
   exit 1
