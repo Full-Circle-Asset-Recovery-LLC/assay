@@ -2,6 +2,8 @@
   "schema_version": 1,
   "artifact": {
     "asset_name": "assay-engine-v0.5.15-x86_64-unknown-linux-gnu",
+    "gzip_sha256": "baf9883e75fcd86635762370add70d8ee7bf46f928f8b4063c5fef0831ace7ff",
+    "gzip_size_bytes": 10381442,
     "elf_build_id_sha1": "e87f55c7157f9b564d9ff24f81b46d6bb88b46c7",
     "sha256": "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a",
     "size_bytes": 27070296,
@@ -18,10 +20,7 @@
   },
   "distribution": {
     "repository": "Full-Circle-Asset-Recovery-LLC/assay",
-    "release_id": 384397081,
-    "release_tag": "ci-baseline-assay-engine-v0.5.15-linux-x86_64",
-    "release_state": "published",
-    "prerelease": true,
-    "asset_id": 549689522
+    "commit": "4d368493967692ffc310deb6b46fef8dc78b0e1a",
+    "path": "assay-engine-v0.5.15-x86_64-unknown-linux-gnu.gz"
   }
 }
