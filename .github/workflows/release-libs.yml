@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   release:
+    if: github.repository == 'developerinlondon/assay'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -22,6 +22,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   # 1. Figure out what, if anything, needs releasing.
   detect:
+    if: github.repository == 'developerinlondon/assay'
     runs-on: ubuntu-latest
     outputs:
       assay_authz_bumped: ${{ steps.assay-authz.outputs.bumped }}
@@ -154,13 +155,8 @@ jobs:
   # each new publish.
   libraries:
     needs: detect
-    if: >
-      needs.detect.outputs.assay_authz_bumped     == 'true' ||
-      needs.detect.outputs.assay_domain_bumped    == 'true' ||
-      needs.detect.outputs.assay_workflow_bumped  == 'true' ||
-      needs.detect.outputs.assay_dashboard_bumped == 'true' ||
-      needs.detect.outputs.assay_auth_bumped      == 'true' ||
-      needs.detect.outputs.assay_vault_bumped     == 'true'
+    if: >-
+      github.repository == 'developerinlondon/assay' && (needs.detect.outputs.assay_authz_bumped == 'true' || needs.detect.outputs.assay_domain_bumped == 'true' || needs.detect.outputs.assay_workflow_bumped == 'true' || needs.detect.outputs.assay_dashboard_bumped == 'true' || needs.detect.outputs.assay_auth_bumped == 'true' || needs.detect.outputs.assay_vault_bumped == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -235,10 +231,8 @@ jobs:
   # release-* jobs.
   binaries:
     needs: [detect, libraries]
-    if: |
-      always() &&
-      needs.detect.outputs.binaries_needed == 'true' &&
-      (needs.libraries.result == 'success' || needs.libraries.result == 'skipped')
+    if: >-
+      github.repository == 'developerinlondon/assay' && (always() && needs.detect.outputs.binaries_needed == 'true' && (needs.libraries.result == 'success' || needs.libraries.result == 'skipped'))
     strategy:
       fail-fast: false
       matrix:
@@ -297,10 +291,8 @@ jobs:
 
   release-assay-engine:
     needs: [detect, libraries, binaries]
-    if: |
-      always() &&
-      (needs.libraries.result == 'success' || needs.libraries.result == 'skipped') &&
-      (needs.binaries.result == 'success' || needs.binaries.result == 'skipped')
+    if: >-
+      github.repository == 'developerinlondon/assay' && (always() && (needs.libraries.result == 'success' || needs.libraries.result == 'skipped') && (needs.binaries.result == 'success' || needs.binaries.result == 'skipped'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -454,7 +446,8 @@ jobs:
     # GHCR; this job only handled auto-rollout to the personal cluster.
     # Flip back to `always() && needs.release-assay-engine.result == 'success'`
     # once #94's checklist is done.
-    if: false
+    if: >-
+      github.repository == 'developerinlondon/assay' && (false)
     runs-on: [self-hosted, assay]
     timeout-minutes: 10
     env:
@@ -498,9 +491,8 @@ jobs:
   # still attached to the GH release and the docker images still ship.
   release-assay-lua-crate:
     needs: [detect, libraries]
-    if: |
-      always() &&
-      (needs.libraries.result == 'success' || needs.libraries.result == 'skipped')
+    if: >-
+      github.repository == 'developerinlondon/assay' && (always() && (needs.libraries.result == 'success' || needs.libraries.result == 'skipped'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -527,10 +519,8 @@ jobs:
   # crate publish — runs in parallel with release-assay-lua-crate.
   release-assay-lua:
     needs: [detect, libraries, binaries]
-    if: |
-      always() &&
-      (needs.libraries.result == 'success' || needs.libraries.result == 'skipped') &&
-      (needs.binaries.result == 'success' || needs.binaries.result == 'skipped')
+    if: >-
+      github.repository == 'developerinlondon/assay' && (always() && (needs.libraries.result == 'success' || needs.libraries.result == 'skipped') && (needs.binaries.result == 'success' || needs.binaries.result == 'skipped'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -676,7 +666,8 @@ jobs:
 
   publish-extension:
     needs: detect
-    if: needs.detect.outputs.extension_bumped == 'true'
+    if: >-
+      github.repository == 'developerinlondon/assay' && (needs.detect.outputs.extension_bumped == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
