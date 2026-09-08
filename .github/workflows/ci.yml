@@ -179,6 +179,7 @@ jobs:
           # Full history keeps moon's project graph and VCS metadata
           # available for any selected target.
           fetch-depth: 0
+          persist-credentials: false
 
       # .mise.toml is the single source of truth for tool versions.
       # Pinning mise itself avoids a flaky `latest` CDN failure
@@ -235,12 +236,10 @@ jobs:
       # The Shamir transition suite proves migration from the exact deployed
       # v0.5.15 engine. That binary predates this branch and cannot be rebuilt
       # from the candidate source. Fetch the deployment-attested artifact from
-      # this fork's draft baseline release, then fail closed on release state,
+      # this fork's historical prerelease, then fail closed on release state,
       # asset cardinality, byte length, digest, or reported version drift.
       - name: Install pinned assay-engine v0.5.15 baseline (Linux)
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           baseline=$(.github/ci/install-assay-engine-baseline.sh "$RUNNER_TEMP/assay-baseline")
           echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"

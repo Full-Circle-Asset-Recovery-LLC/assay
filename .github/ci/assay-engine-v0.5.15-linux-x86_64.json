@@ -20,7 +20,8 @@
     "repository": "Full-Circle-Asset-Recovery-LLC/assay",
     "release_id": 384397081,
     "release_tag": "ci-baseline-assay-engine-v0.5.15-linux-x86_64",
-    "release_state": "draft",
+    "release_state": "published",
+    "prerelease": true,
     "asset_id": 549689522
   }
 }

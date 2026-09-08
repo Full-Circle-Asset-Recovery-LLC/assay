@@ -9,11 +9,6 @@ if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "assay-engine v0.5.15 baseline is available only for x86_64 Linux" >&2
   exit 1
 fi
-if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-  echo "GITHUB_TOKEN is required to download the pinned draft release asset" >&2
-  exit 1
-fi
-
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 manifest="$script_dir/assay-engine-v0.5.15-linux-x86_64.json"
 mapfile -t metadata < <(python3 - "$manifest" <<'PY'
@@ -28,6 +23,7 @@ values = (
     str(manifest["distribution"]["release_id"]),
     manifest["distribution"]["release_tag"],
     manifest["distribution"]["release_state"],
+    str(manifest["distribution"]["prerelease"]).lower(),
     str(manifest["distribution"]["asset_id"]),
     manifest["artifact"]["asset_name"],
     manifest["artifact"]["elf_build_id_sha1"],
@@ -38,7 +34,7 @@ values = (
 print("\n".join(values))
 PY
 )
-if [[ ${#metadata[@]} -ne 10 ]]; then
+if [[ ${#metadata[@]} -ne 11 ]]; then
   echo "baseline manifest did not yield the required metadata" >&2
   exit 1
 fi
@@ -47,19 +43,19 @@ repository="${metadata[0]}"
 release_id="${metadata[1]}"
 release_tag="${metadata[2]}"
 release_state="${metadata[3]}"
-asset_id="${metadata[4]}"
-asset_name="${metadata[5]}"
-expected_build_id="${metadata[6]}"
-expected_sha256="${metadata[7]}"
-expected_size="${metadata[8]}"
-expected_version="${metadata[9]}"
+expected_prerelease="${metadata[4]}"
+asset_id="${metadata[5]}"
+asset_name="${metadata[6]}"
+expected_build_id="${metadata[7]}"
+expected_sha256="${metadata[8]}"
+expected_size="${metadata[9]}"
+expected_version="${metadata[10]}"
 
 scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
 release_json="$scratch/release.json"
 api="https://api.github.com/repos/$repository"
 headers=(
-  --header "Authorization: Bearer $GITHUB_TOKEN"
   --header "X-GitHub-Api-Version: 2022-11-28"
 )
 
@@ -86,25 +82,30 @@ if len(matches) != 1:
         f"expected exactly one asset with id {sys.argv[3]} and name {sys.argv[4]!r}, found {len(matches)}"
     )
 print(str(release.get("draft", False)).lower())
+print(str(release.get("prerelease", False)).lower())
 print(matches[0]["url"])
 print(str(matches[0].get("size", "")))
 print(str(matches[0].get("digest", "")))
 PY
 )
-if [[ ${#release[@]} -ne 4 ]]; then
+if [[ ${#release[@]} -ne 5 ]]; then
   echo "release metadata did not identify exactly one baseline asset" >&2
   exit 1
 fi
-if [[ "$release_state" == "draft" && "${release[0]}" != "true" ]]; then
-  echo "baseline release $release_tag is not in the manifest-declared draft state" >&2
+if [[ "$release_state" != "published" || "${release[0]}" != "false" ]]; then
+  echo "baseline release $release_tag does not match manifest state $release_state" >&2
   exit 1
 fi
-if [[ "${release[2]}" != "$expected_size" ]]; then
-  echo "GitHub asset size mismatch: expected $expected_size, got ${release[2]}" >&2
+if [[ "$expected_prerelease" != "true" || "${release[1]}" != "$expected_prerelease" ]]; then
+  echo "baseline release $release_tag is not the required prerelease" >&2
   exit 1
 fi
-if [[ "${release[3]}" != "sha256:$expected_sha256" ]]; then
-  echo "GitHub asset digest mismatch: expected sha256:$expected_sha256, got ${release[3]}" >&2
+if [[ "${release[3]}" != "$expected_size" ]]; then
+  echo "GitHub asset size mismatch: expected $expected_size, got ${release[3]}" >&2
+  exit 1
+fi
+if [[ "${release[4]}" != "sha256:$expected_sha256" ]]; then
+  echo "GitHub asset digest mismatch: expected sha256:$expected_sha256, got ${release[4]}" >&2
   exit 1
 fi
 
