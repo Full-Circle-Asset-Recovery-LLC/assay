@@ -488,6 +488,11 @@ async fn checkpoint_delete_mode(path: &std::path::Path) {
 
 #[tokio::test]
 async fn actual_baseline_v0515_child_creates_legacy_schema_then_candidate_transitions() {
+    assert_ne!(
+        env!("CARGO_PKG_VERSION"),
+        "0.5.15",
+        "migration regression requires a candidate newer than the pinned baseline"
+    );
     let temp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let data_dir = temp.path().join("data");
@@ -770,6 +775,26 @@ async fn offline_init_rejects_arbitrary_binary_self_labeled_as_v0515() {
     let result = authorized_command(&config, &out).output().unwrap();
     assert!(!result.status.success());
     assert!(!out.exists());
+}
+
+#[tokio::test]
+async fn offline_init_rejects_wrong_version_for_pinned_baseline_binary() {
+    let (_tmp, config, pool) = fixture().await;
+    pool.close().await;
+    let out = config.parent().unwrap().join("shares.json");
+    let manifest = write_backup_manifest(&config);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    value["baseline_binary"]["version"] = serde_json::Value::String("0.6.0".into());
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let result = authorized_command(&config, &out).output().unwrap();
+    assert!(!result.status.success());
+    assert!(!out.exists());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("baseline binary does not match the trusted release attestation")
+    );
 }
 
 #[tokio::test]

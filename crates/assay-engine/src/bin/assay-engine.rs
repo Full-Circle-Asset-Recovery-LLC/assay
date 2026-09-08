@@ -1232,7 +1232,6 @@ fn validate_backup_manifest(
         anyhow::bail!("baseline binary checksum mismatch");
     }
     if manifest.baseline_binary.version != TRUSTED_BASELINE_VERSION
-        || manifest.baseline_binary.version != env!("CARGO_PKG_VERSION")
         || manifest.baseline_binary.source_commit != TRUSTED_BASELINE_SOURCE_COMMIT
         || manifest.baseline_binary.sha256 != TRUSTED_BASELINE_SHA256
     {
