@@ -16,11 +16,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 ENGINE_BIN="${ASSAY_ENGINE_BIN:-$REPO_ROOT/target/release/assay-engine}"
-DATA_DIR="${ASSAY_E2E_DATA_DIR:-/tmp/assay-engine-e2e-data}"
 LOG_FILE="${ASSAY_E2E_ENGINE_LOG:-/tmp/assay-engine-e2e.log}"
-CONFIG="$HERE/fixtures/engine.toml"
 BASE="${ASSAY_E2E_BASE:-http://localhost:8420}"
 ADMIN_KEY="${ASSAY_E2E_ADMIN_KEY:-dev-admin-key-change-me}"
+ENGINE_PID=""
+E2E_ROOT=""
+TMP_ROOT=""
 
 say() { printf "[e2e] %s\n" "$*"; }
 
@@ -29,20 +30,38 @@ if [[ ! -x "$ENGINE_BIN" ]]; then
   exit 1
 fi
 
-# Fresh data dir so module + audit + instance fixtures land clean.
-rm -rf "$DATA_DIR"
-mkdir -p "$DATA_DIR"
+cleanup() {
+  if [[ -n "$ENGINE_PID" ]]; then
+    say "tearing down (pid $ENGINE_PID)"
+    kill "$ENGINE_PID" 2>/dev/null || true
+    wait "$ENGINE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$E2E_ROOT" && "$(dirname "$E2E_ROOT")" == "$TMP_ROOT" \
+    && "$(basename "$E2E_ROOT")" == assay-engine-e2e.?????? ]]; then
+    rm -rf -- "$E2E_ROOT"
+  fi
+}
+trap cleanup EXIT
+
+# ProcessLock requires the data directory's immediate parent to be private
+# to the current operator. Keep all module databases under a unique 0700
+# parent so concurrent E2E jobs cannot share state.
+TMP_ROOT="$(cd /tmp && pwd -P)"
+E2E_ROOT="$(mktemp -d /tmp/assay-engine-e2e.XXXXXX)"
+E2E_ROOT="$(cd "$E2E_ROOT" && pwd -P)"
+chmod 0700 "$E2E_ROOT"
+DATA_DIR="$E2E_ROOT/data"
+mkdir -m 0700 "$DATA_DIR"
+CONFIG="$E2E_ROOT/engine.toml"
+sed "s|__ASSAY_E2E_DATA_DIR__|$DATA_DIR|" "$HERE/fixtures/engine.toml" >"$CONFIG"
+if grep -q '__ASSAY_E2E_DATA_DIR__' "$CONFIG"; then
+  echo "[e2e] FATAL: failed to render private data_dir into $CONFIG" >&2
+  exit 1
+fi
 
 say "starting assay-engine on :8420 (data_dir=$DATA_DIR)"
 "$ENGINE_BIN" serve --config "$CONFIG" >"$LOG_FILE" 2>&1 &
 ENGINE_PID=$!
-
-cleanup() {
-  say "tearing down (pid $ENGINE_PID)"
-  kill "$ENGINE_PID" 2>/dev/null || true
-  wait "$ENGINE_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 # Wait for /api/v1/engine/core/info to respond — public, no auth.
 say "waiting for engine to come up"

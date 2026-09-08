@@ -2,6 +2,38 @@
 
 All notable changes to Assay are documented here.
 
+## assay-engine 0.6.0 — 2026-09-08
+
+### Changed
+
+- SQLite boot now carries a process-bound runtime authority through `EngineBoot::run` and
+  `EngineState`, preventing guarded background work from outliving the process lock. This changes
+  the public boot method signature and makes `EngineState` non-constructible outside the crate;
+  downstream embedders should use the public `assay_engine::run` entry point.
+
+### Fixed
+
+- Engine and dashboard E2E fixtures now place every SQLite module database below a unique,
+  operator-owned private directory, satisfying the process-lock ownership check without weakening
+  it.
+
+## assay-vault 0.5.0 — 2026-09-08
+
+### Changed
+
+- `SealState` is now the sole runtime owner of active KEK material. `VaultCtx::kek` is replaced by
+  `VaultCtx::seal_state`, Shamir constructors require the persisted KEK digest, and `ActiveKek`
+  distinguishes environment-sealed keys from plaintext keys. These are intentional pre-1.0 API
+  changes that prevent stale key handles and unverified Shamir shares from bypassing seal state.
+- SQLite KEK rotation serialises key-using writes and sealing through one operation gate, commits
+  all metadata and ciphertext rewraps atomically, and swaps runtime state only after commit.
+  PostgreSQL rotation fails closed until a cross-process drain and key-reload protocol exists.
+
+### Fixed
+
+- PostgreSQL vault migrations keep compatibility DDL inside the advisory-locked transaction, and
+  a present non-UTF-8 `ASSAY_VAULT_SEAL_KEY` is rejected instead of being treated as absent.
+
 ## assay-lua 0.20.7 — 2026-09-04
 
 ### Added

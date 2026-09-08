@@ -11,7 +11,7 @@ public_url = "http://localhost:8420"
 
 [backend]
 type = "sqlite"
-data_dir = "/tmp/assay-engine-e2e-data"
+data_dir = "__ASSAY_E2E_DATA_DIR__"
 
 [auth]
 audience = ["http://localhost:8420"]

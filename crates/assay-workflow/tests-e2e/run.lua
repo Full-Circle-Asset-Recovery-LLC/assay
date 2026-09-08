@@ -26,8 +26,10 @@ local WORKER = HERE .. "/fixtures/demo-worker.lua"
 
 local PORT = tonumber(env.get("ASSAY_E2E_PORT") or "8080")
 local BASE = "http://localhost:" .. PORT
-local DB = env.get("ASSAY_E2E_DB") or "/tmp/assay-e2e.sqlite"
-local ENGINE_CONFIG = env.get("ASSAY_E2E_ENGINE_CONFIG") or "/tmp/assay-e2e-engine.toml"
+local E2E_ROOT
+local TMP_ROOT
+local DATA_DIR
+local ENGINE_CONFIG
 local ENGINE_LOG = env.get("ASSAY_E2E_ENGINE_LOG") or "/tmp/assay-e2e-engine.log"
 local WORKER_LOG = env.get("ASSAY_E2E_WORKER_LOG") or "/tmp/assay-e2e-worker.log"
 -- when state.auth is Some (now always), every /api/v1/engine/workflow/*
@@ -50,16 +52,63 @@ local function fail(msg)
   error("[e2e] FATAL: " .. msg, 0)
 end
 
--- Reset the SQLite backend on every run so demo-2 always lands as a
--- fresh PENDING row. fs.remove is a no-op-equivalent if the file
--- doesn't exist (raises, swallowed by pcall) and fs.write creates the
--- empty file the engine then opens.
-local function reset_db()
-  pcall(fs.remove, DB)
-  fs.write(DB, "")
+local function shell_quote(value)
+  return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
--- Write the engine config file pointing at our ephemeral SQLite DB +
+local function create_private_data_dir()
+  local tmp = shell.exec("cd /tmp && pwd -P")
+  if tmp.status ~= 0 then
+    fail("unable to resolve the temporary directory: " .. (tmp.stderr or ""))
+  end
+  TMP_ROOT = (tmp.stdout or ""):gsub("%s+$", "")
+
+  local result = shell.exec("mktemp -d /tmp/assay-workflow-e2e.XXXXXX")
+  if result.status ~= 0 then
+    fail("unable to create private fixture directory: " .. (result.stderr or ""))
+  end
+
+  local created = (result.stdout or ""):gsub("%s+$", "")
+  local canonical = shell.exec("cd " .. shell_quote(created) .. " && pwd -P")
+  if canonical.status ~= 0 then
+    fail("unable to resolve the fixture directory: " .. (canonical.stderr or ""))
+  end
+  E2E_ROOT = (canonical.stdout or ""):gsub("%s+$", "")
+  local expected_prefix = TMP_ROOT .. "/assay-workflow-e2e."
+  if E2E_ROOT:sub(1, #expected_prefix) ~= expected_prefix
+      or not E2E_ROOT:sub(#expected_prefix + 1):match("^[%w]+$") then
+    fail("mktemp returned an unexpected fixture path")
+  end
+
+  DATA_DIR = E2E_ROOT .. "/data"
+  ENGINE_CONFIG = E2E_ROOT .. "/engine.toml"
+  local setup = shell.exec(
+    "chmod 0700 " .. shell_quote(E2E_ROOT)
+      .. " && mkdir -m 0700 " .. shell_quote(DATA_DIR)
+  )
+  if setup.status ~= 0 then
+    fail("unable to secure fixture directory: " .. (setup.stderr or ""))
+  end
+end
+
+local function tail(path, max_lines)
+  local ok, body = pcall(fs.read, path)
+  if not ok or not body then
+    return "<unable to read " .. path .. ">"
+  end
+  local lines = {}
+  for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+    table.insert(lines, line)
+  end
+  local selected = {}
+  local first = math.max(1, #lines - max_lines + 1)
+  for i = first, #lines do
+    table.insert(selected, lines[i])
+  end
+  return table.concat(selected, "\n")
+end
+
+-- Write the engine config file pointing at our private SQLite data dir +
 -- the port under test. Matches the schema in
 -- crates/assay-engine/src/config.rs (v0.13.0 format).
 local function write_engine_config()
@@ -69,7 +118,7 @@ bind_addr = "127.0.0.1:%d"
 
 [backend]
 type = "sqlite"
-path = "%s"
+data_dir = "%s"
 
 # Plan-15 slice 3 (v0.14.0): the engine refuses to start when there are
 # no operator users AND no admin api keys. The dashboard e2e never
@@ -82,7 +131,7 @@ admin_api_keys = ["dev-admin-key-change-me"]
 [logging]
 level = "info"
 format = "pretty"
-]], PORT, DB)
+]], PORT, DATA_DIR)
   fs.write(ENGINE_CONFIG, toml)
 end
 
@@ -107,10 +156,15 @@ local function teardown()
   -- Reap so we don't leave zombies.
   if worker_pid then pcall(process.wait, worker_pid, { timeout = 3 }) end
   if engine_pid then pcall(process.wait, engine_pid, { timeout = 3 }) end
+  local expected_prefix = TMP_ROOT and (TMP_ROOT .. "/assay-workflow-e2e.") or ""
+  if E2E_ROOT and E2E_ROOT:sub(1, #expected_prefix) == expected_prefix
+      and E2E_ROOT:sub(#expected_prefix + 1):match("^[%w]+$") then
+    pcall(shell.exec, "rm -rf -- " .. shell_quote(E2E_ROOT))
+  end
 end
 
 local ok, err = pcall(function()
-  reset_db()
+  create_private_data_dir()
   write_engine_config()
 
   log("starting assay-engine on :" .. PORT)
@@ -123,7 +177,7 @@ local ok, err = pcall(function()
   engine_pid = h.pid
 
   if not wait_for_engine() then
-    fail("engine never came up; tail of " .. ENGINE_LOG)
+    fail("engine never came up; tail of " .. ENGINE_LOG .. ":\n" .. tail(ENGINE_LOG, 80))
   end
   log("engine ready (pid " .. engine_pid .. ")")
 

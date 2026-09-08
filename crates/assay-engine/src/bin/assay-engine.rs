@@ -512,9 +512,7 @@ async fn offline_init_shamir(
     }
     let trusted_operator_id = trusted_operator_id()?;
     if operator_id != trusted_operator_id {
-        anyhow::bail!(
-            "--operator-id does not match the OS operator identity {trusted_operator_id}"
-        );
+        anyhow::bail!("--operator-id does not match the OS operator identity");
     }
     let operator_id = trusted_operator_id.as_str();
     if !backup_manifest.is_file() {

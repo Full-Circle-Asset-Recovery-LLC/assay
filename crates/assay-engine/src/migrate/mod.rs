@@ -325,7 +325,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let source = temp.path().join("data");
+        let source = temp.path().canonicalize().unwrap().join("data");
         let engine_lock = crate::process_lock::ProcessLock::acquire(&source).unwrap();
         let plan = Plan {
             source_dir: source.display().to_string(),

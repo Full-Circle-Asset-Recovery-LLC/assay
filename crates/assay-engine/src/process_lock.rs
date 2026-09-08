@@ -323,13 +323,14 @@ mod tests {
     #[test]
     fn anchored_directory_survives_path_replacement() {
         let temp = tempfile::tempdir().unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let data = temp.path().join("data");
+        let data = temp_root.join("data");
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock = ProcessLock::acquire(&data).unwrap();
         let anchored = lock.anchored_data_dir().unwrap();
-        let original = temp.path().join("original");
+        let original = temp_root.join("original");
         std::fs::rename(&data, &original).unwrap();
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -344,16 +345,17 @@ mod tests {
     #[test]
     fn public_or_symlinked_data_directory_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let public = temp.path().join("public");
+        let public = temp_root.join("public");
         std::fs::create_dir(&public).unwrap();
         std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ProcessLock::acquire(&public).is_err());
 
-        let private = temp.path().join("private");
+        let private = temp_root.join("private");
         std::fs::create_dir(&private).unwrap();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let link = temp.path().join("link");
+        let link = temp_root.join("link");
         symlink(&private, &link).unwrap();
         assert!(ProcessLock::acquire(&link).is_err());
     }
@@ -369,8 +371,9 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let data = temp.path().join("missing-data");
+        let data = temp_root.join("missing-data");
         // SAFETY: test deliberately controls and restores the process umask.
         let old = unsafe { libc::umask(0o002) };
         let guard = UmaskGuard(old);
@@ -393,15 +396,16 @@ mod tests {
             }
         }
         let temp = tempfile::tempdir().unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         // SAFETY: test deliberately controls and restores the process umask.
         let guard = UmaskGuard(unsafe { libc::umask(0o002) });
-        assert!(ProcessLock::acquire(&temp.path().join("missing/child")).is_err());
+        assert!(ProcessLock::acquire(&temp_root.join("missing/child")).is_err());
 
-        let real_parent = temp.path().join("real-parent");
+        let real_parent = temp_root.join("real-parent");
         std::fs::create_dir(&real_parent).unwrap();
         std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let linked_parent = temp.path().join("linked-parent");
+        let linked_parent = temp_root.join("linked-parent");
         symlink(&real_parent, &linked_parent).unwrap();
         assert!(ProcessLock::acquire(&linked_parent.join("data")).is_err());
         drop(guard);
