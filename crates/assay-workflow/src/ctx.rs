@@ -21,6 +21,19 @@ pub struct BackgroundTasks {
     _archival: Option<JoinHandle<()>>,
 }
 
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self._scheduler.abort();
+        self._timer_poller.abort();
+        self._health_monitor.abort();
+        self._dispatch_recovery.abort();
+        #[cfg(feature = "s3-archival")]
+        if let Some(archival) = &self._archival {
+            archival.abort();
+        }
+    }
+}
+
 /// The workflow context. Owns the store, background-task handles, and
 /// per-request config. Serves as both the orchestrator (all engine methods
 /// live as `impl WorkflowCtx<S>`) and the axum state (`Arc<WorkflowCtx<S>>`).
@@ -45,15 +58,47 @@ pub struct WorkflowCtx<S: WorkflowStore> {
 impl<S: WorkflowStore> WorkflowCtx<S> {
     /// Start the context with all background tasks.
     pub fn start(store: Arc<S>) -> Self {
-        let _scheduler = tokio::spawn(scheduler::run_scheduler(Arc::clone(&store)));
-        let _timer_poller = tokio::spawn(timers::run_timer_poller(Arc::clone(&store)));
-        let _health_monitor = tokio::spawn(health::run_health_monitor(Arc::clone(&store)));
-        let _dispatch_recovery =
-            tokio::spawn(dispatch_recovery::run_dispatch_recovery(Arc::clone(&store)));
+        Self::start_with_runtime_guard(store, None)
+    }
+
+    pub fn start_with_runtime_guard(
+        store: Arc<S>,
+        runtime_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        let scheduler_store = Arc::clone(&store);
+        let scheduler_guard = runtime_guard.clone();
+        let _scheduler = tokio::spawn(async move {
+            let _runtime_guard = scheduler_guard;
+            scheduler::run_scheduler(scheduler_store).await;
+        });
+        let timer_store = Arc::clone(&store);
+        let timer_guard = runtime_guard.clone();
+        let _timer_poller = tokio::spawn(async move {
+            let _runtime_guard = timer_guard;
+            timers::run_timer_poller(timer_store).await;
+        });
+        let health_store = Arc::clone(&store);
+        let health_guard = runtime_guard.clone();
+        let _health_monitor = tokio::spawn(async move {
+            let _runtime_guard = health_guard;
+            health::run_health_monitor(health_store).await;
+        });
+        let recovery_store = Arc::clone(&store);
+        let recovery_guard = runtime_guard.clone();
+        let _dispatch_recovery = tokio::spawn(async move {
+            let _runtime_guard = recovery_guard;
+            dispatch_recovery::run_dispatch_recovery(recovery_store).await;
+        });
 
         #[cfg(feature = "s3-archival")]
-        let _archival = crate::archival::ArchivalConfig::from_env()
-            .map(|cfg| tokio::spawn(crate::archival::run_archival(Arc::clone(&store), cfg)));
+        let _archival = crate::archival::ArchivalConfig::from_env().map(|cfg| {
+            let archival_store = Arc::clone(&store);
+            let archival_guard = runtime_guard;
+            tokio::spawn(async move {
+                let _runtime_guard = archival_guard;
+                crate::archival::run_archival(archival_store, cfg).await;
+            })
+        });
 
         info!("Workflow engine started");
 
@@ -135,19 +180,33 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
         workflow_id: &str,
     ) -> anyhow::Result<()> {
         self.store.mark_workflow_dispatchable(workflow_id).await?;
-        if self.bus.is_some()
-            && let Some(wf) = self.store.get_workflow(workflow_id).await?
-        {
-            self.emit(
-                &wf.namespace,
-                WorkflowBusEvent::WorkflowNeedsDispatch {
-                    workflow_id: workflow_id.to_string(),
-                    task_queue: wf.task_queue,
-                },
-            )
-            .await;
-        }
+        self.emit_needs_dispatch(workflow_id).await;
         Ok(())
+    }
+
+    /// Emit `WorkflowNeedsDispatch` without touching the row — for callers
+    /// whose store method already armed the workflow inside its own
+    /// transaction. Like [`WorkflowCtx::emit`] this never fails the caller:
+    /// the arming is durable, so a missed wake-up costs a poll interval,
+    /// not the run.
+    pub(crate) async fn emit_needs_dispatch(&self, workflow_id: &str) {
+        if self.bus.is_none() {
+            return;
+        }
+        match self.store.get_workflow(workflow_id).await {
+            Ok(Some(wf)) => {
+                self.emit(
+                    &wf.namespace,
+                    WorkflowBusEvent::WorkflowNeedsDispatch {
+                        workflow_id: workflow_id.to_string(),
+                        task_queue: wf.task_queue,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(?e, "needs-dispatch emit lookup failed"),
+        }
     }
 }
 

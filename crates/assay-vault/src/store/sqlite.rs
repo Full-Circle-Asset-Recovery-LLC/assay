@@ -532,12 +532,16 @@ mod sealing {
             &self,
             threshold: u8,
             shares_count: u8,
-        ) -> VaultResult<(String, Vec<Vec<u8>>)> {
-            let (kid, shares) =
+        ) -> VaultResult<(String, [u8; 32], Vec<Vec<u8>>)> {
+            let (kid, digest, shares) =
                 crate::crypto::kek_store::init_shamir_sqlite(&self.pool, threshold, shares_count)
                     .await
                     .map_err(|e| VaultError::Backend(anyhow::anyhow!("seal init_shamir: {e}")))?;
-            Ok((kid, shares.into_iter().map(|s| s.0).collect()))
+            Ok((
+                kid,
+                digest,
+                shares.into_iter().map(|s| s.into_bytes()).collect(),
+            ))
         }
 
         async fn set_sealed(&self, kid: &str, sealed: bool) -> VaultResult<()> {

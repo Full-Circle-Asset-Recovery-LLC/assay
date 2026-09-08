@@ -1,10 +1,13 @@
 name: CI
 
-# pull_request validates the merge commit; branch protection blocks
-# direct pushes to main, so a push trigger would re-run on identical
-# code. Tag pushes (`v*`) are handled by release.yml.
+# Pull requests validate GitHub's proposed merge commit. The main push reruns
+# affected checks against the immutable merged commit and is the only event
+# allowed to produce a source-deployment artifact. Tag pushes (`v*`) are
+# handled by release.yml.
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -36,6 +39,7 @@ jobs:
         with:
           filters: |
             assay_rust:
+              - '.github/ci/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -87,6 +91,7 @@ jobs:
               - 'crates/assay/stdlib/**'
             ci:
               - 'renovate.json'
+              - '.github/ci/**'
               - '.github/workflows/**'
               - '.github/release/**'
               - '.mise.toml'
@@ -149,7 +154,7 @@ jobs:
           targets=()
 
           if [[ "$ASSAY_RUST" == "true" ]]; then
-            targets+=(assay-lua:lint assay-lua:build assay-lua:test)
+            targets+=(assay-lua:fmt assay-lua:lint assay-lua:build assay-lua:test)
           elif [[ "$ASSAY_LUA_TESTS" == "true" ]]; then
             targets+=(assay-lua:test-lua-stdlib)
           fi
@@ -177,6 +182,7 @@ jobs:
           # Full history keeps moon's project graph and VCS metadata
           # available for any selected target.
           fetch-depth: 0
+          persist-credentials: false
 
       # .mise.toml is the single source of truth for tool versions.
       # Pinning mise itself avoids a flaky `latest` CDN failure
@@ -222,10 +228,32 @@ jobs:
           rm -rf target
           ln -s /var/cache/runner-work/assay-target target
 
-      # mise's rust plugin defaults to the `minimal` profile (no clippy).
-      - name: Install clippy component
+      # mise's rust plugin defaults to the `minimal` profile, which carries
+      # neither clippy nor rustfmt. rust-toolchain.toml names both, but mise
+      # installs the toolchain itself rather than letting rustup resolve that
+      # file, so the components are still added here.
+      - name: Install clippy and rustfmt components
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true'
-        run: rustup component add clippy
+        run: rustup component add clippy rustfmt
+
+      # The Shamir transition suite proves migration from the exact deployed
+      # v0.5.15 engine. That binary predates this branch and cannot be rebuilt
+      # from the candidate source. Fetch the deployment-attested artifact from
+      # this fork's historical prerelease, then fail closed on release state,
+      # asset cardinality, byte length, digest, or reported version drift.
+      - name: Install pinned assay-engine v0.5.15 baseline (Linux)
+        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux'
+        run: |
+          baseline=$(.github/ci/install-assay-engine-baseline.sh "$RUNNER_TEMP/assay-baseline")
+          echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"
+
+      - name: Install pinned assay-engine v0.5.15 baseline (macOS)
+        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'macOS'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          baseline=$(python3 .github/ci/install-assay-engine-baseline-darwin.py "$RUNNER_TEMP/assay-baseline")
+          echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"
 
       # Swatinem/rust-cache@v2 with a Cargo.lock-keyed cache. The
       # `key` input ties saves to the locked dep graph, so unchanged
@@ -325,6 +353,151 @@ jobs:
             exit 1
           fi
 
+  # Produce the native GNU binary used by source deployments only for the exact
+  # commit pushed to main and only after the complete Linux/macOS check matrix
+  # accepts that commit. Ubuntu 22.04 fixes the build ABI at glibc 2.35; the
+  # packaging step also rejects any newer GLIBC symbol requirement. PR merge
+  # refs are intentionally ineligible because their synthetic SHA is not the
+  # eventual merged source revision.
+  assay-engine-gnu-artifact:
+    name: assay-engine GNU artifact
+    needs: [changes, check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.assay_rust == 'true' && needs.check.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: assay-engine-gnu-release
+          cache-targets: true
+
+      - name: Verify exact clean source checkout
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Build native GNU assay-engine
+        run: >-
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          -p assay-engine --bin assay-engine
+
+      - name: Package binary and provenance manifest
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          source_binary=target/x86_64-unknown-linux-gnu/release/assay-engine
+          artifact_dir=dist/assay-engine-gnu
+          artifact_name=assay-engine-x86_64-unknown-linux-gnu
+          mkdir -p "$artifact_dir"
+          install -m 0500 "$source_binary" "$artifact_dir/$artifact_name"
+
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+          readelf -l "$artifact_dir/$artifact_name" | grep -Fq '/lib64/ld-linux-x86-64.so.2'
+
+          ARTIFACT_PATH="$artifact_dir/$artifact_name"
+          ARTIFACT_NAME="$artifact_name"
+          VERSION_OUTPUT="$("$ARTIFACT_PATH" --version)"
+          RUSTC_VERSION="$(rustc --version)"
+          CARGO_LOCK_SHA256="$(sha256sum Cargo.lock | awk '{print $1}')"
+          ELF_BUILD_ID="$(readelf -n "$ARTIFACT_PATH" | awk '/Build ID:/{print $3; exit}')"
+          [[ "$ELF_BUILD_ID" =~ ^[0-9a-f]{40}$ ]]
+          BINARY_SHA256="$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
+          BINARY_SIZE="$(wc -c < "$ARTIFACT_PATH" | tr -d '[:space:]')"
+          GLIBC_MAX_REQUIRED="$(python3 - "$ARTIFACT_PATH" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          labels = set(
+              re.findall(
+                  rb"GLIBC_(\d+(?:\.\d+)+)",
+                  subprocess.check_output(["readelf", "--version-info", sys.argv[1]]),
+              )
+          )
+          versions = {tuple(map(int, label.split(b"."))) for label in labels}
+          if not versions:
+              raise SystemExit("binary has no GLIBC symbol requirements")
+          maximum = max(versions)
+          width = max(len(maximum), 2)
+          padded_maximum = maximum + (0,) * (width - len(maximum))
+          limit = (2, 35) + (0,) * (width - 2)
+          rendered = ".".join(map(str, maximum))
+          if padded_maximum > limit:
+              raise SystemExit(f"binary requires GLIBC_{rendered}, newer than 2.35")
+          print(rendered)
+          PY
+          )"
+          export ARTIFACT_PATH ARTIFACT_NAME VERSION_OUTPUT RUSTC_VERSION CARGO_LOCK_SHA256
+          export ELF_BUILD_ID BINARY_SHA256 BINARY_SIZE GLIBC_MAX_REQUIRED
+
+          python3 - "$artifact_dir/manifest.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          manifest = {
+              "schema_version": 1,
+              "source": {
+                  "repository": os.environ["SOURCE_REPOSITORY"],
+                  "commit": os.environ["SOURCE_SHA"],
+                  "ref": os.environ["SOURCE_REF"],
+                  "event_name": os.environ["SOURCE_EVENT_NAME"],
+              },
+              "workflow": {
+                  "run_id": int(os.environ["WORKFLOW_RUN_ID"]),
+                  "run_attempt": int(os.environ["WORKFLOW_RUN_ATTEMPT"]),
+              },
+              "builder": {
+                  "runner": "ubuntu-22.04",
+                  "target": "x86_64-unknown-linux-gnu",
+                  "glibc": "2.35",
+                  "rustc": os.environ["RUSTC_VERSION"],
+                  "cargo_lock_sha256": os.environ["CARGO_LOCK_SHA256"],
+              },
+              "artifact": {
+                  "name": os.environ["ARTIFACT_NAME"],
+                  "sha256": os.environ["BINARY_SHA256"],
+                  "size_bytes": int(os.environ["BINARY_SIZE"]),
+                  "elf_build_id_sha1": os.environ["ELF_BUILD_ID"],
+                  "glibc_max_required": os.environ["GLIBC_MAX_REQUIRED"],
+                  "version_output": os.environ["VERSION_OUTPUT"],
+              },
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+          (cd "$artifact_dir" && sha256sum "$artifact_name" > SHA256SUMS)
+          cat "$artifact_dir/manifest.json"
+          cat "$artifact_dir/SHA256SUMS"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: assay-engine-gnu-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/assay-engine-gnu
+          if-no-files-found: error
+          retention-days: 14
+
   workflow-lint:
     name: workflow-lint
     needs: changes
@@ -333,6 +506,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+
+      - name: Release changelog regression tests
+        run: |
+          python3 .github/release/test_extract_changelog.py
+          python3 .github/ci/test_artifact_packaging.py
 
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/deploy.yml

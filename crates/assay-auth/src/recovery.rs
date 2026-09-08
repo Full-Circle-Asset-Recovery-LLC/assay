@@ -123,6 +123,7 @@ pub struct PasswordRecovery {
     recovery_url: Url,
     token_ttl: Duration,
     request_cooldown: Duration,
+    runtime_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl PasswordRecovery {
@@ -139,7 +140,13 @@ impl PasswordRecovery {
             recovery_url,
             token_ttl,
             request_cooldown,
+            runtime_guard: None,
         }
+    }
+
+    pub fn with_runtime_guard(mut self, runtime_guard: Arc<dyn Send + Sync>) -> Self {
+        self.runtime_guard = Some(runtime_guard);
+        self
     }
 
     pub async fn request(&self, email: &str) -> anyhow::Result<RecoveryRequestStatus> {
@@ -211,6 +218,16 @@ async fn request_recovery(
         return unavailable();
     };
     tokio::spawn(async move {
+        #[cfg(debug_assertions)]
+        if let (Ok(ready), Ok(resume)) = (
+            std::env::var("ASSAY_TEST_RECOVERY_TASK_READY"),
+            std::env::var("ASSAY_TEST_RECOVERY_TASK_RESUME"),
+        ) {
+            let _ = std::fs::write(&ready, b"ready");
+            while !std::path::Path::new(&resume).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         if let Err(error) = recovery.request(&body.email).await {
             tracing::error!(%error, "password recovery request failed");
         }

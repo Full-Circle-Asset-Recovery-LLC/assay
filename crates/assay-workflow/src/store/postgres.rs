@@ -1,10 +1,16 @@
 use anyhow::Result;
 use sqlx::PgPool;
 
-use crate::store::{RetryEvent, WorkflowStore, retry_denial};
+use crate::store::{
+    NOT_A_SETTLEMENT, RetryEvent, WorkflowStore, payload_activity_id, retry_denial, settle_outcome,
+};
 use crate::types::*;
 
 const RETRY_ACTIVITY_SELECT: &str = "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat FROM workflow.activities WHERE workflow_id = $1 AND status = 'FAILED' ORDER BY seq DESC LIMIT 1 FOR UPDATE";
+/// Terminal activities whose workflow is still live and whose terminal
+/// history event never landed — the half-settled state the transactional
+/// settle path can no longer create, and older rows can still be in.
+const UNSETTLED_ACTIVITY_SELECT: &str = "SELECT a.id, a.workflow_id, a.seq, a.name, a.task_queue, a.input, a.status, a.result, a.error, a.attempt, a.max_attempts, a.initial_interval_secs, a.backoff_coefficient, a.start_to_close_secs, a.heartbeat_timeout_secs, a.claimed_by, a.scheduled_at, a.started_at, a.completed_at, a.last_heartbeat FROM workflow.activities a JOIN workflow.workflows w ON w.id = a.workflow_id WHERE a.status IN ('COMPLETED', 'FAILED') AND w.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT') AND w.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = a.workflow_id AND e.activity_id = a.id AND e.event_type IN ('ActivityCompleted', 'ActivityFailed')) ORDER BY a.completed_at ASC LIMIT $1";
 const RETRY_ACTIVITY_UPDATE: &str = "UPDATE workflow.activities SET status = 'PENDING', result = NULL, error = NULL, attempt = 1, claimed_by = NULL, scheduled_at = $1, started_at = NULL, completed_at = NULL, last_heartbeat = NULL WHERE id = $2 RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat";
 
 /// v0.1.2 schema layout: workflow tables live in the `workflow` schema;
@@ -57,6 +63,10 @@ CREATE TABLE IF NOT EXISTS workflow.events (
     seq             INTEGER NOT NULL,
     event_type      TEXT NOT NULL,
     payload         TEXT,
+    -- Set on ActivityCompleted / ActivityFailed only. Answers "did this
+    -- activity's terminal event land" without parsing payload JSON, which
+    -- is what the settle transaction and the reconciler both need.
+    activity_id     BIGINT,
     timestamp       DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wf_events_lookup ON workflow.events(workflow_id, seq);
@@ -163,117 +173,6 @@ CREATE INDEX IF NOT EXISTS idx_engine_events_ts_prune ON engine.events(ts);
 
 "#;
 
-/// One-shot relocation: moves v0.13.1's prefixed `public.workflow_*`
-/// tables into the `workflow` schema. Idempotent — each step gates on
-/// `to_regclass(public.<old>) IS NOT NULL` so fresh installs and
-/// already-migrated DBs are no-ops.
-///
-/// SCHEMA above already created empty `workflow.*` tables; we DROP
-/// them with CASCADE here before ALTER TABLE … SET SCHEMA so the move
-/// has somewhere to land. RESTRICT would fail on the FKs between
-/// workflow.events / .activities / .timers / .signals / .snapshots
-/// and workflow.workflows.
-const V0_13_2_RELOCATION_SQL: &str = r#"
-DO $$
-DECLARE
-    has_old BOOLEAN;
-BEGIN
-    -- Each table: if the legacy public.<old> exists, drop the empty
-    -- schema-qualified twin (created above by SCHEMA) and move the
-    -- legacy table into its new home.
-
-    -- workflows
-    SELECT to_regclass('public.workflows') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.workflows CASCADE;
-        ALTER TABLE public.workflows SET SCHEMA workflow;
-    END IF;
-
-    -- workflow_events → workflow.events
-    SELECT to_regclass('public.workflow_events') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.events CASCADE;
-        ALTER TABLE public.workflow_events SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_events RENAME TO events;
-    END IF;
-
-    -- workflow_activities → workflow.activities
-    SELECT to_regclass('public.workflow_activities') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.activities CASCADE;
-        ALTER TABLE public.workflow_activities SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_activities RENAME TO activities;
-    END IF;
-
-    -- workflow_timers → workflow.timers
-    SELECT to_regclass('public.workflow_timers') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.timers CASCADE;
-        ALTER TABLE public.workflow_timers SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_timers RENAME TO timers;
-    END IF;
-
-    -- workflow_signals → workflow.signals
-    SELECT to_regclass('public.workflow_signals') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.signals CASCADE;
-        ALTER TABLE public.workflow_signals SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_signals RENAME TO signals;
-    END IF;
-
-    -- workflow_snapshots → workflow.snapshots
-    SELECT to_regclass('public.workflow_snapshots') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.snapshots CASCADE;
-        ALTER TABLE public.workflow_snapshots SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_snapshots RENAME TO snapshots;
-    END IF;
-
-    -- workflow_schedules → workflow.schedules
-    SELECT to_regclass('public.workflow_schedules') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.schedules CASCADE;
-        ALTER TABLE public.workflow_schedules SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_schedules RENAME TO schedules;
-    END IF;
-
-    -- workflow_workers → workflow.workers
-    SELECT to_regclass('public.workflow_workers') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.workers CASCADE;
-        ALTER TABLE public.workflow_workers SET SCHEMA workflow;
-        ALTER TABLE workflow.workflow_workers RENAME TO workers;
-    END IF;
-
-    -- namespaces → workflow.namespaces
-    SELECT to_regclass('public.namespaces') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS workflow.namespaces CASCADE;
-        ALTER TABLE public.namespaces SET SCHEMA workflow;
-    END IF;
-
-    -- public.api_keys: retired in plan-15 slice 3 (workflow REST API
-    -- auth moved to the auth module — see CHANGELOG). Drop any
-    -- orphaned legacy table so an upgraded v0.13.1 install doesn't
-    -- carry it forward.
-    SELECT to_regclass('public.api_keys') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE public.api_keys CASCADE;
-    END IF;
-
-    -- engine_events → engine.events (notification outbox; preserves the
-    -- v0.13.1 publish-on-commit guarantee since the new INSERT into
-    -- engine.events sits in the same transaction as the pg_notify call).
-    SELECT to_regclass('public.engine_events') IS NOT NULL INTO has_old;
-    IF has_old THEN
-        DROP TABLE IF EXISTS engine.events CASCADE;
-        ALTER TABLE public.engine_events SET SCHEMA engine;
-        ALTER TABLE engine.engine_events RENAME TO events;
-    END IF;
-END
-$$;
-"#;
-
 /// Split a Postgres DDL script into individual statements ready for `sqlx::query`.
 ///
 /// Drops pure-comment lines (those starting with `--` after optional whitespace)
@@ -332,20 +231,18 @@ impl PostgresStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        // Apply the base schema (tables + indexes) statement-by-statement.
-        // This creates the workflow + engine schemas and the v0.13.2
-        // schema-qualified tables. On a fresh install this is the only
-        // step that runs; on an upgrade from v0.13.1 the empty new
-        // tables are dropped + replaced by the legacy public.* tables
-        // in the relocation block below.
+        assay_domain::engine::retry_ddl(3, || self.migrate_once()).await
+    }
+
+    async fn migrate_once(&self) -> Result<()> {
+        // One advisory-locked transaction so concurrent first boots
+        // serialise instead of racing the catalog inserts.
+        let mut tx = self.pool.begin().await?;
+        assay_domain::engine::acquire_schema_lock(&mut tx).await?;
         for statement in sanitise_schema(SCHEMA) {
-            sqlx::query(&statement).execute(&self.pool).await?;
+            sqlx::query(&statement).execute(&mut *tx).await?;
         }
-        // v0.13.1 → v0.13.2 relocation. Idempotent: on fresh installs
-        // the public.* tables don't exist and every branch is a no-op.
-        sqlx::raw_sql(V0_13_2_RELOCATION_SQL)
-            .execute(&self.pool)
-            .await?;
+        super::relocation::run(&mut tx).await?;
         // Drop the v0.13.0 LISTEN/NOTIFY triggers if they still exist on
         // the target database. The Rust-managed CDC outbox in
         // assay_domain::events is the replacement; leaving stale
@@ -361,9 +258,53 @@ impl PostgresStore {
             DROP FUNCTION IF EXISTS assay_notify_task();
             "#,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("ALTER TABLE workflow.events ADD COLUMN IF NOT EXISTS activity_id BIGINT")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_wf_events_activity ON workflow.events(activity_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.backfill_event_activity_ids().await?;
         Ok(())
+    }
+
+    /// Populate `events.activity_id` on terminal activity events written
+    /// before the column existed. Without it every pre-upgrade completion
+    /// reads as unsettled and the reconciler appends a duplicate event.
+    /// Payloads that carry no usable id are stamped `NOT_A_SETTLEMENT` so
+    /// the scan terminates instead of revisiting them.
+    async fn backfill_event_activity_ids(&self) -> Result<()> {
+        const BATCH: i64 = 500;
+        loop {
+            let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+                "SELECT id, payload FROM workflow.events
+                 WHERE activity_id IS NULL
+                   AND event_type IN ('ActivityCompleted', 'ActivityFailed')
+                 LIMIT $1",
+            )
+            .bind(BATCH)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let batch_len = rows.len() as i64;
+            for (id, payload) in rows {
+                sqlx::query("UPDATE workflow.events SET activity_id = $1 WHERE id = $2")
+                    .bind(payload_activity_id(payload.as_deref()))
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            if batch_len < BATCH {
+                return Ok(());
+            }
+        }
     }
 
     /// Try to acquire pg_advisory_lock for leader election.
@@ -886,6 +827,13 @@ impl WorkflowStore for PostgresStore {
             .bind(failed.id)
             .fetch_one(&mut *tx)
             .await?;
+        // The ActivityFailed event stays in history, but it no longer
+        // records this activity's settlement — the row is open again.
+        sqlx::query("UPDATE workflow.events SET activity_id = $1 WHERE activity_id = $2")
+            .bind(NOT_A_SETTLEMENT)
+            .bind(failed.id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE workflow.workflows
              SET status = 'WAITING', result = NULL, error = NULL, completed_at = NULL,
@@ -951,6 +899,85 @@ impl WorkflowStore for PostgresStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn settle_activity(&self, settlement: &ActivitySettlement<'_>) -> Result<SettleOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow.activities WHERE id = $1 FOR UPDATE")
+                .bind(settlement.activity_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((status,)) = current else {
+            return Ok(SettleOutcome::Unknown);
+        };
+        let settled = matches!(status.as_str(), "COMPLETED" | "FAILED");
+        let event_id: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM workflow.events
+             WHERE workflow_id = $1 AND activity_id = $2
+               AND event_type IN ('ActivityCompleted', 'ActivityFailed')
+             LIMIT 1",
+        )
+        .bind(settlement.workflow_id)
+        .bind(settlement.activity_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if !settled {
+            sqlx::query(
+                "UPDATE workflow.activities
+                 SET status = $1, result = $2, error = $3, completed_at = $4
+                 WHERE id = $5",
+            )
+            .bind(if settlement.failed {
+                "FAILED"
+            } else {
+                "COMPLETED"
+            })
+            .bind(settlement.result)
+            .bind(settlement.error)
+            .bind(settlement.now)
+            .bind(settlement.activity_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // An open activity always gets its event, even in the shape a
+        // superseded settlement event would otherwise mask: reaching a
+        // terminal status without the matching event is the defect.
+        if !settled || event_id.is_none() {
+            let seq: (i32,) = sqlx::query_as(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM workflow.events WHERE workflow_id = $1",
+            )
+            .bind(settlement.workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO workflow.events (workflow_id, seq, event_type, payload, activity_id, timestamp)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(settlement.workflow_id)
+            .bind(seq.0)
+            .bind(settlement.event_type)
+            .bind(settlement.payload)
+            .bind(settlement.activity_id)
+            .bind(settlement.now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE workflow.workflows SET needs_dispatch = TRUE WHERE id = $1")
+            .bind(settlement.workflow_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(settle_outcome(settled, event_id.is_some()))
+    }
+
+    async fn list_unsettled_activities(&self, limit: i64) -> Result<Vec<WorkflowActivity>> {
+        let rows = sqlx::query_as::<_, PgActivityRow>(UNSETTLED_ACTIVITY_SELECT)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn heartbeat_activity(&self, id: i64, _details: Option<&str>) -> Result<()> {
@@ -1070,6 +1097,41 @@ impl WorkflowStore for PostgresStore {
         .bind(sig.received_at)
         .fetch_one(&self.pool)
         .await?;
+        Ok(row.0)
+    }
+
+    async fn deliver_signal(&self, sig: &WorkflowSignal, payload_json: &str) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO workflow.signals (workflow_id, name, payload, consumed, received_at) VALUES ($1, $2, $3, FALSE, $4) RETURNING id",
+        )
+        .bind(&sig.workflow_id)
+        .bind(&sig.name)
+        .bind(&sig.payload)
+        .bind(sig.received_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        let seq: (i32,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM workflow.events WHERE workflow_id = $1",
+        )
+        .bind(&sig.workflow_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workflow.events (workflow_id, seq, event_type, payload, timestamp)
+             VALUES ($1, $2, 'SignalReceived', $3, $4)",
+        )
+        .bind(&sig.workflow_id)
+        .bind(seq.0)
+        .bind(payload_json)
+        .bind(sig.received_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE workflow.workflows SET needs_dispatch = TRUE WHERE id = $1")
+            .bind(&sig.workflow_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(row.0)
     }
 
@@ -1345,13 +1407,13 @@ impl WorkflowStore for PostgresStore {
         Ok(())
     }
 
-    async fn heartbeat_worker(&self, id: &str, now: f64) -> Result<()> {
-        sqlx::query("UPDATE workflow.workers SET last_heartbeat = $1 WHERE id = $2")
+    async fn heartbeat_worker(&self, id: &str, now: f64) -> Result<bool> {
+        let res = sqlx::query("UPDATE workflow.workers SET last_heartbeat = $1 WHERE id = $2")
             .bind(now)
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn list_workers(&self, namespace: &str) -> Result<Vec<WorkflowWorker>> {

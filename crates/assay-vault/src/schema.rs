@@ -236,8 +236,8 @@ CREATE INDEX IF NOT EXISTS idx_vault_biscuit_root_active
 -- depends on `sealing_method`:
 --   plaintext       — Phase 1 placeholder; blob IS the raw 32-byte KEK.
 --                     Tracked in kek_metadata so Phase 2 can re-wrap.
---   shamir          — blob is empty; the KEK is split into rows in
---                     vault.unseal_shares and reconstituted on unseal.
+--   shamir          — blob is empty; one-shot shares are returned to the
+--                     operator and never persisted by the first release.
 --   kms-aws / kms-gcp — blob is the cloud-KMS-encrypted KEK; auto-unseal
 --                     calls the cloud KMS Decrypt API on boot.
 --   hsm             — blob is the PKCS#11-wrapped KEK (opt-in feature).
@@ -246,6 +246,7 @@ CREATE TABLE IF NOT EXISTS vault.kek_metadata (
     sealing_method   TEXT NOT NULL,
     sealed           BOOLEAN NOT NULL DEFAULT TRUE,
     sealed_blob      BYTEA NOT NULL DEFAULT ''::bytea,
+    kek_digest       BYTEA,
     share_threshold  INTEGER,
     share_count      INTEGER,
     sealed_at        DOUBLE PRECISION,
@@ -253,9 +254,8 @@ CREATE TABLE IF NOT EXISTS vault.kek_metadata (
     created_at       DOUBLE PRECISION NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())
 );
 
--- Shamir-Secret-Sharing shares for the init-unseal flow. Encrypted at
--- rest with the share-holder's identity key (X25519) so a stolen DB
--- snapshot doesn't yield the KEK.
+-- Reserved for a future identity-encrypted share escrow flow. First-release
+-- Shamir initialization never writes this table.
 CREATE TABLE IF NOT EXISTS vault.unseal_shares (
     kid              TEXT NOT NULL REFERENCES vault.kek_metadata(kid) ON DELETE CASCADE,
     share_index      INTEGER NOT NULL,
@@ -263,6 +263,27 @@ CREATE TABLE IF NOT EXISTS vault.unseal_shares (
     encrypted_share  BYTEA NOT NULL,
     created_at       DOUBLE PRECISION NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW()),
     PRIMARY KEY (kid, share_index)
+);
+
+CREATE TABLE IF NOT EXISTS vault.sealing_transition_audit (
+    transition_id   TEXT PRIMARY KEY,
+    old_kid         TEXT NOT NULL,
+    new_kid         TEXT NOT NULL,
+    old_method      TEXT NOT NULL,
+    new_method      TEXT NOT NULL,
+    operator_id     TEXT NOT NULL,
+    backup_ref      TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    backup_generation TEXT NOT NULL,
+    baseline_binary_digest TEXT NOT NULL,
+    database_artifact_digests TEXT NOT NULL,
+    bundle_digest   TEXT NOT NULL,
+    share_threshold INTEGER NOT NULL,
+    share_count     INTEGER NOT NULL,
+    plaintext_backup_acknowledged BOOLEAN NOT NULL,
+    schema_migrated BOOLEAN NOT NULL,
+    outcome         TEXT NOT NULL,
+    created_at      DOUBLE PRECISION NOT NULL
 );
 
 -- ── S8: audit forwarding sinks ────────────────────────────────────
@@ -479,6 +500,7 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
             sealing_method   TEXT NOT NULL,
             sealed           INTEGER NOT NULL DEFAULT 1,
             sealed_blob      BLOB NOT NULL DEFAULT x'',
+            kek_digest       BLOB,
             share_threshold  INTEGER,
             share_count      INTEGER,
             sealed_at        REAL,
@@ -495,6 +517,29 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
             encrypted_share  BLOB NOT NULL,
             created_at       REAL NOT NULL,
             PRIMARY KEY (kid, share_index)
+        )",
+    ),
+    (
+        "sealing_transition_audit",
+        "CREATE TABLE IF NOT EXISTS vault.sealing_transition_audit (
+            transition_id   TEXT PRIMARY KEY,
+            old_kid         TEXT NOT NULL,
+            new_kid         TEXT NOT NULL,
+            old_method      TEXT NOT NULL,
+            new_method      TEXT NOT NULL,
+            operator_id     TEXT NOT NULL,
+            backup_ref      TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            backup_generation TEXT NOT NULL,
+            baseline_binary_digest TEXT NOT NULL,
+            database_artifact_digests TEXT NOT NULL,
+            bundle_digest   TEXT NOT NULL,
+            share_threshold INTEGER NOT NULL,
+            share_count     INTEGER NOT NULL,
+            plaintext_backup_acknowledged INTEGER NOT NULL,
+            schema_migrated INTEGER NOT NULL,
+            outcome         TEXT NOT NULL,
+            created_at      REAL NOT NULL
         )",
     ),
     // ── S8: audit forwarding sinks ───────────────────────────────
@@ -521,24 +566,45 @@ pub const SQLITE_DDL_V1: &[(&str, &str)] = &[
 /// context names the first line so engine boot logs are actionable.
 #[cfg(feature = "backend-postgres")]
 pub async fn migrate_postgres(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    assay_domain::engine::retry_ddl(3, || migrate_postgres_once(pool)).await
+}
+
+#[cfg(feature = "backend-postgres")]
+async fn migrate_postgres_once(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     use anyhow::Context;
+    let mut tx = pool.begin().await.context("begin vault migrate tx")?;
+    assay_domain::engine::acquire_schema_lock(&mut tx)
+        .await
+        .context("acquire schema migration advisory lock")?;
     for ddl in [PG_DDL_V1] {
         for stmt in split_pg_statements(ddl) {
             sqlx::query(&stmt)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("vault pg migrate: {}", first_line(&stmt)))?;
         }
     }
+    sqlx::query("ALTER TABLE vault.kek_metadata ADD COLUMN IF NOT EXISTS kek_digest BYTEA")
+        .execute(&mut *tx)
+        .await
+        .context("vault pg migrate: add kek_digest")?;
+    sqlx::query(
+        "ALTER TABLE vault.sealing_transition_audit
+         ADD COLUMN IF NOT EXISTS schema_migrated BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("vault pg migrate: add schema_migrated receipt")?;
     sqlx::query(
         "INSERT INTO engine.migrations (module, version) VALUES ($1, $2) \
          ON CONFLICT DO NOTHING",
     )
     .bind(MODULE_NAME)
     .bind(MIGRATION_VERSION)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("record vault migration in engine.migrations")?;
+    tx.commit().await.context("commit vault migrate tx")?;
     Ok(())
 }
 
@@ -557,6 +623,36 @@ pub async fn migrate_sqlite(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("vault sqlite migrate: {label}"))?;
         }
+    }
+    let has_digest: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vault.pragma_table_info('kek_metadata') WHERE name = 'kek_digest')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect vault.kek_metadata columns")?;
+    if !has_digest {
+        sqlx::query("ALTER TABLE vault.kek_metadata ADD COLUMN kek_digest BLOB")
+            .execute(pool)
+            .await
+            .context("vault sqlite migrate: add kek_digest")?;
+    }
+    let has_schema_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM vault.pragma_table_info('sealing_transition_audit')
+            WHERE name = 'schema_migrated'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .context("inspect vault.sealing_transition_audit columns")?;
+    if !has_schema_migrated {
+        sqlx::query(
+            "ALTER TABLE vault.sealing_transition_audit
+             ADD COLUMN schema_migrated INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .context("vault sqlite migrate: add schema_migrated receipt")?;
     }
     sqlx::query("INSERT OR IGNORE INTO engine.migrations (module, version) VALUES (?, ?)")
         .bind(MODULE_NAME)

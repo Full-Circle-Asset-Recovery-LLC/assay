@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::crypto::aead::{KEY_LEN, NONCE_LEN, decrypt, encrypt, random_nonce};
 use crate::error::{Result, VaultError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// In-memory KEK material. Cheap to clone — the inner Arc shares the
 /// raw bytes across consumers without re-allocating.
@@ -30,6 +31,7 @@ pub struct KekHandle {
     inner: Arc<KekInner>,
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct KekInner {
     kid: String,
     key: [u8; KEY_LEN],
@@ -67,6 +69,12 @@ impl KekHandle {
                 key,
             }),
         }
+    }
+
+    /// Construct from a drop-zeroizing source buffer. The handle's inner
+    /// key has its own `Drop` zeroization; the consumed source is wiped too.
+    pub fn from_zeroizing(kid: impl Into<String>, key: zeroize::Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self::from_bytes(kid, *key)
     }
 
     /// Generate a fresh ephemeral KEK with a content-addressed kid.

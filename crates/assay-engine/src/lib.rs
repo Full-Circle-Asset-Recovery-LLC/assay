@@ -39,10 +39,40 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "vault")]
+fn vault_ctx_from_active(
+    active: assay_vault::crypto::kek_store::ActiveKek,
+) -> anyhow::Result<assay_vault::VaultCtx> {
+    match active {
+        assay_vault::crypto::kek_store::ActiveKek::Plaintext { handle, .. } => {
+            Ok(assay_vault::VaultCtx::new().with_kek(handle))
+        }
+        assay_vault::crypto::kek_store::ActiveKek::Environment { handle, .. } => {
+            Ok(assay_vault::VaultCtx::new()
+                .with_kek_method(handle, assay_vault::crypto::SealingMethod::EnvKey))
+        }
+        assay_vault::crypto::kek_store::ActiveKek::Shamir {
+            kid,
+            threshold,
+            shares_count,
+            kek_digest,
+        } => Ok(assay_vault::VaultCtx::new().with_sealed_shamir(
+            kid,
+            kek_digest,
+            threshold,
+            shares_count,
+        )),
+        _ => anyhow::bail!("unsupported active vault KEK sealing method"),
+    }
+}
+
 pub mod config;
 pub mod embedded;
 pub mod engine_api;
 pub mod init;
+#[cfg(all(feature = "backend-postgres", feature = "backend-sqlite"))]
+pub mod migrate;
+pub mod process_lock;
 pub mod server;
 pub mod state;
 
@@ -69,6 +99,15 @@ pub async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
     server::bind_and_serve(&bind_addr, engine.router).await
 }
 
+/// The seal key for the vault's master KEK, from the environment.
+/// A malformed value fails boot rather than quietly leaving the vault
+/// unsealed at rest.
+#[cfg(feature = "vault")]
+fn vault_seal_key() -> anyhow::Result<Option<assay_vault::crypto::env_seal::SealKey>> {
+    assay_vault::crypto::env_seal::SealKey::from_env()
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", assay_vault::crypto::env_seal::ENV_VAR))
+}
+
 /// Build the vault context iff the runtime `engine.modules.vault.enabled`
 /// row is TRUE. Loads the master KEK from `vault.kek_metadata` (or seeds
 /// a fresh one on first boot) and composes the per-feature stores
@@ -81,14 +120,14 @@ async fn build_vault_ctx_pg(
     if !modules.iter().any(|m| m == "vault") {
         return Ok(None);
     }
-    let kek = assay_vault::crypto::kek_store::load_or_init_postgres(pool)
+    let seal = vault_seal_key()?;
+    let active = assay_vault::crypto::kek_store::load_or_init_active_postgres(pool, seal.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("vault KEK bootstrap (pg): {e}"))?;
     // The `vault` umbrella feature on assay-vault implies vault-kv +
     // vault-transit, so the with_* methods are unconditionally
     // available here.
-    let mut ctx = assay_vault::VaultCtx::new()
-        .with_kek(kek)
+    let mut ctx = vault_ctx_from_active(active)?
         .with_kv(assay_vault::store::postgres::PgKvStore::new(pool.clone()))
         .with_transit(assay_vault::store::postgres::PgTransitStore::new(
             pool.clone(),
@@ -147,11 +186,11 @@ async fn build_vault_ctx_sqlite(
     if !modules.iter().any(|m| m == "vault") {
         return Ok(None);
     }
-    let kek = assay_vault::crypto::kek_store::load_or_init_sqlite(pool)
+    let seal = vault_seal_key()?;
+    let active = assay_vault::crypto::kek_store::load_or_init_active_sqlite(pool, seal.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("vault KEK bootstrap (sqlite): {e}"))?;
-    let mut ctx = assay_vault::VaultCtx::new()
-        .with_kek(kek)
+    let mut ctx = vault_ctx_from_active(active)?
         .with_kv(assay_vault::store::sqlite::SqliteKvStore::new(pool.clone()))
         .with_transit(assay_vault::store::sqlite::SqliteTransitStore::new(
             pool.clone(),
@@ -598,6 +637,76 @@ fn build_passkey_manager(
 mod public_url_tests {
     use super::*;
 
+    #[cfg(all(unix, feature = "vault", feature = "backend-sqlite"))]
+    #[test]
+    fn non_unicode_seal_key_fails_before_kek_bootstrap() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        const CHILD_MARKER: &str = "ASSAY_ENGINE_TEST_NON_UNICODE_SEAL_KEY_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let pool = crate::init::sqlite_pool(dir.path().to_str().unwrap())
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "CREATE TABLE engine.migrations (
+                        module TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        PRIMARY KEY (module, version)
+                    )",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+                assay_vault::schema::migrate_sqlite(&pool).await.unwrap();
+                let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vault.kek_metadata")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(before, 0);
+
+                let error = match build_vault_ctx_sqlite(&["vault".to_string()], &pool).await {
+                    Ok(_) => panic!("invalid Unicode seal key must fail vault boot"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains("ASSAY_VAULT_SEAL_KEY"),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("valid Unicode"), "{error}");
+                let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vault.kek_metadata")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(after, 0, "failed boot must not seed KEK metadata");
+            });
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "public_url_tests::non_unicode_seal_key_fails_before_kek_bootstrap",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(
+                assay_vault::crypto::env_seal::ENV_VAR,
+                OsString::from_vec(vec![0xff, 0xfe]),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn config(server_public_url: &str, auth_public_url: Option<&str>) -> EngineConfig {
         let auth_public_url = auth_public_url
             .map(|url| format!("public_url = \"{url}\""))
@@ -700,6 +809,22 @@ data_dir = ":memory:"
         );
         assert_eq!(options.token_ttl, std::time::Duration::from_secs(1200));
         assert_eq!(options.request_cooldown, std::time::Duration::from_secs(90));
+    }
+
+    #[cfg(feature = "vault-sealing-shamir")]
+    #[test]
+    fn shamir_active_kek_builds_a_sealed_context() {
+        let active = assay_vault::crypto::kek_store::ActiveKek::Shamir {
+            kid: "kek-test".into(),
+            threshold: 3,
+            shares_count: 5,
+            kek_digest: [7; 32],
+        };
+        let ctx = vault_ctx_from_active(active).unwrap();
+        let status = ctx.seal_state.status();
+        assert!(status.sealed);
+        assert_eq!(status.method.as_column(), "shamir");
+        assert_eq!(status.share_threshold, Some(3));
     }
 }
 

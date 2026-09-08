@@ -452,7 +452,7 @@ async fn health_answers_without_a_token() {
 #[tokio::test]
 async fn health_reports_a_sealed_engine_as_unavailable() {
     let ctx = ctx().await;
-    ctx.seal_state.seal().unwrap();
+    ctx.seal_state.seal().await.unwrap();
     let app = app_for(ctx, "secrets");
 
     let response = app
@@ -467,7 +467,7 @@ async fn health_reports_a_sealed_engine_as_unavailable() {
 #[tokio::test]
 async fn a_sealed_engine_refuses_reads_rather_than_serving_stale_plaintext() {
     let ctx = ctx_with_one_secret().await;
-    ctx.seal_state.seal().unwrap();
+    ctx.seal_state.seal().await.unwrap();
     let app = app_for(ctx, "secrets");
 
     let response = app

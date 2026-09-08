@@ -28,12 +28,6 @@ use crate::transit::{TransitService, TransitStore};
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct VaultCtx {
-    /// Master KEK handle. Always present so KV / transit services can
-    /// hold a clone — but the live sealing state in `seal_state`
-    /// gates whether the handle is "trusted active" or stale (sealed).
-    /// Per-request handlers MUST consult `seal_state.require_unsealed()`
-    /// before touching key material.
-    pub kek: KekHandle,
     /// Runtime sealing state. Phase 2 introduces this; the engine boot
     /// path wires it from `vault.kek_metadata`. For first-boot /
     /// plaintext deployments it starts unsealed; for shamir-sealed
@@ -83,7 +77,6 @@ impl Default for VaultCtx {
         let seal_state =
             SealState::unsealed(SealingMethod::Plaintext, kek.kid().to_string(), kek.clone());
         Self {
-            kek,
             seal_state,
             seal_store: None,
             #[cfg(feature = "vault-kv")]
@@ -123,10 +116,15 @@ impl VaultCtx {
     /// after `crypto::kek_store::load_or_init_*` returns. Initialises
     /// the seal state to `unsealed` with method = Plaintext (Phase-1
     /// shape). For shamir installs use [`Self::with_sealed_shamir`].
-    pub fn with_kek(mut self, kek: KekHandle) -> Self {
-        let seal_state =
-            SealState::unsealed(SealingMethod::Plaintext, kek.kid().to_string(), kek.clone());
-        self.kek = kek;
+    pub fn with_kek(self, kek: KekHandle) -> Self {
+        self.with_kek_method(kek, SealingMethod::Plaintext)
+    }
+
+    /// As [`Self::with_kek`], but records how the KEK is sealed at rest
+    /// so `/sys/seal-status` reports what the store actually holds
+    /// rather than always claiming plaintext.
+    pub fn with_kek_method(mut self, kek: KekHandle, method: SealingMethod) -> Self {
+        let seal_state = SealState::unsealed(method, kek.kid().to_string(), kek.clone());
         self.seal_state = seal_state;
         self
     }
@@ -135,8 +133,14 @@ impl VaultCtx {
     /// shares via `/sys/unseal` to bring it up. The KEK held on the
     /// ctx is a placeholder until then — handlers must check
     /// `seal_state.require_unsealed()` before using it.
-    pub fn with_sealed_shamir(mut self, kid: String, threshold: u8, shares_count: u8) -> Self {
-        self.seal_state = SealState::sealed_shamir(kid, threshold, shares_count);
+    pub fn with_sealed_shamir(
+        mut self,
+        kid: String,
+        kek_digest: [u8; 32],
+        threshold: u8,
+        shares_count: u8,
+    ) -> Self {
+        self.seal_state = SealState::sealed_shamir(kid, kek_digest, threshold, shares_count);
         self
     }
 

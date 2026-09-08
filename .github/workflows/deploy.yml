@@ -33,6 +33,7 @@ env:
 
 jobs:
   deploy:
+    if: github.repository == 'developerinlondon/assay'
     name: Deploy site to Cloudflare Pages
     runs-on: ubuntu-latest
     permissions:

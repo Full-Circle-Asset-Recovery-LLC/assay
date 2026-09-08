@@ -29,6 +29,9 @@ use crate::error::{Result, VaultError};
 pub enum SealingMethod {
     /// Phase-1 placeholder. Blob IS the raw 32 bytes. WARN-logged.
     Plaintext,
+    /// KEK sealed with a 32-byte key supplied by the environment, so a
+    /// database dump carries ciphertext rather than the key itself.
+    EnvKey,
     /// Shamir Secret Sharing — KEK split into N shares; threshold K
     /// shares reconstruct on unseal. Phase 2 default for non-cloud.
     Shamir { threshold: u8, shares_count: u8 },
@@ -49,6 +52,7 @@ impl SealingMethod {
     pub fn as_column(&self) -> &'static str {
         match self {
             Self::Plaintext => "plaintext",
+            Self::EnvKey => crate::crypto::env_seal::METHOD_ENV,
             Self::Shamir { .. } => "shamir",
             Self::KmsAws { .. } => "kms-aws",
             Self::KmsGcp { .. } => "kms-gcp",
@@ -58,6 +62,7 @@ impl SealingMethod {
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "plaintext" => Ok(Self::Plaintext),
+            crate::crypto::env_seal::METHOD_ENV => Ok(Self::EnvKey),
             // Shamir + KMS variants need their parameters from
             // surrounding columns (share_threshold, share_count, KMS
             // config from engine.toml). The store layer hands the
@@ -77,11 +82,12 @@ impl SealingMethod {
 pub mod shamir {
     use super::*;
     use crate::crypto::aead::KEY_LEN;
+    use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
     /// One unseal share — the wire format an operator passes back to
     /// `unseal`. Internally it's the byte representation `sharks`
     /// produces.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
     pub struct Share(pub Vec<u8>);
 
     impl Share {
@@ -91,6 +97,13 @@ pub mod shamir {
         pub fn as_bytes(&self) -> &[u8] {
             &self.0
         }
+        pub fn into_bytes(mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0)
+        }
+    }
+
+    pub fn encode_share_base64(bytes: &[u8]) -> String {
+        data_encoding::BASE64.encode(bytes)
     }
 
     /// Split a 32-byte KEK into `shares_count` Shamir shares; any
@@ -120,7 +133,7 @@ pub mod shamir {
     /// `Sealed` if fewer shares were provided; returns `Crypto` if the
     /// shares fail to reconstruct (corruption, mismatched threshold,
     /// shares from a different secret).
-    pub fn combine_shares(threshold: u8, shares: &[Share]) -> Result<[u8; KEY_LEN]> {
+    pub fn combine_shares(threshold: u8, shares: &[Share]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
         if shares.len() < threshold as usize {
             return Err(VaultError::Sealed);
         }
@@ -132,16 +145,17 @@ pub mod shamir {
                     .map_err(|e| VaultError::Crypto(format!("bad share: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        let secret = s
-            .recover(&parsed)
-            .map_err(|e| VaultError::Crypto(format!("shamir recover: {e}")))?;
+        let secret = Zeroizing::new(
+            s.recover(&parsed)
+                .map_err(|e| VaultError::Crypto(format!("shamir recover: {e}")))?,
+        );
         if secret.len() != KEY_LEN {
             return Err(VaultError::Crypto(format!(
                 "recovered secret is {} bytes; expected {KEY_LEN}",
                 secret.len()
             )));
         }
-        let mut key = [0u8; KEY_LEN];
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
         key.copy_from_slice(&secret);
         Ok(key)
     }
@@ -158,10 +172,21 @@ pub mod shamir {
             assert_eq!(shares.len(), 5);
             // Any 3 shares reconstruct.
             let recovered = combine_shares(3, &shares[..3]).unwrap();
-            assert_eq!(recovered, kek);
+            assert_eq!(*recovered, kek);
             // A different 3.
             let recovered2 = combine_shares(3, &shares[2..5]).unwrap();
-            assert_eq!(recovered2, kek);
+            assert_eq!(*recovered2, kek);
+        }
+
+        #[test]
+        fn reconstructed_secret_is_guarded_by_zeroizing_type() {
+            let kek = random_dek();
+            let shares = split_kek(&kek, 3, 5).unwrap();
+            let recovered = combine_shares(3, &shares[..3]).unwrap();
+            assert!(
+                std::any::type_name_of_val(&recovered).contains("Zeroizing"),
+                "reconstructed secret must have drop-time zeroization"
+            );
         }
 
         #[test]
@@ -190,7 +215,7 @@ pub mod shamir {
             // outright depending on where the corruption hits — either
             // way the result is NOT equal to the original.
             if let Ok(bad) = combine_shares(3, &shares[..3]) {
-                assert_ne!(bad, kek);
+                assert_ne!(*bad, kek);
             }
         }
     }
@@ -229,7 +254,11 @@ pub trait SealStore: Send + Sync + 'static {
     /// bytes (one `Vec<u8>` per share). The shares are returned ONCE —
     /// the engine does not retain a copy. Operators MUST distribute
     /// and store them securely.
-    async fn init_shamir(&self, threshold: u8, shares_count: u8) -> Result<(String, Vec<Vec<u8>>)>;
+    async fn init_shamir(
+        &self,
+        threshold: u8,
+        shares_count: u8,
+    ) -> Result<(String, [u8; 32], Vec<Vec<u8>>)>;
 
     /// Update the at-rest sealed flag for a kid. The runtime
     /// [`crate::crypto::seal_state::SealState`] is the source of truth

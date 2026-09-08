@@ -1,6 +1,6 @@
 ---
 name: assay
-description: Infrastructure scripting runtime — 65 modules for Kubernetes, ArgoCD, Vault, Prometheus, HTTP servers, AI agents, databases. Replaces kubectl, Python, Node.js, curl, jq in one ~12 MB binary.
+description: Infrastructure scripting runtime — 68 modules for Kubernetes, ArgoCD, Vault, Prometheus, HTTP servers, AI agents, databases. Replaces kubectl, Python, Node.js, curl, jq in one ~12 MB binary.
 metadata:
   author: developerinlondon
   version: "0.6.1"
@@ -44,7 +44,7 @@ assay modules
 | `assay exec -e 'lua code'`  | Evaluate Lua inline                           |
 | `assay exec script.lua`     | Run Lua file via exec subcommand              |
 | `assay context "<keyword>"` | Find modules matching keyword, shows quickref |
-| `assay modules`             | List all 66 modules (63 stdlib + builtins)    |
+| `assay modules`             | List all 66 modules (66 stdlib + builtins)    |
 | `assay modules --json`      | Same list as JSON with keywords/quickrefs     |
 
 **Read-only mode.** The global `--readonly` flag (or `ASSAY_READONLY=1`) disables every mutating
@@ -209,6 +209,25 @@ String header values still work as before.
 
 URLs: `postgres://user:pass@host:5432/db`, `mysql://...`, `sqlite:///path/to/file.db`
 
+### DNS
+
+| Function                         | Description                                               |
+| -------------------------------- | --------------------------------------------------------- |
+| `dns.lookup(name, type, opts?)`  | Look up `A`, `AAAA`, `CNAME`, `MX`, `NS` or `TXT` records |
+| `dns.dnsbl(domain, list, opts?)` | Ask a DNS blacklist about a domain → `{listed, codes}`    |
+
+Options: `{ server = "1.1.1.1", timeout_ms = 5000, tries = 2 }` — the system resolver by default,
+and `server` is refused while a policy is installed.
+
+`MX` answers are `{preference, exchange}` tables sorted lowest-first; every other type is an array
+of strings, with a `TXT` record's 255-byte chunks rejoined into one. A name that does not exist is
+an empty array, while a timeout or `SERVFAIL` raises — "nothing lists this domain" and "nobody
+answered" mean opposite things and must not look alike.
+
+`dns.dnsbl` reads the `127.0.0.0/8` reply a list answers with, except the whole of
+`127.255.255.0/24`, which the big lists return to public resolvers to mean "you may not ask". That
+one is reported in `codes` but is not a listing.
+
 ### WebSocket and Templates
 
 | Function                          | Description                                                               |
@@ -363,7 +382,7 @@ embedding assay inside another admin UI. Full table + theme tokens in
 
 ## Stdlib Modules Quick Reference
 
-All 63 stdlib modules follow `require("assay.<name>")` then `M.client(url, opts)`.
+All 66 stdlib modules follow `require("assay.<name>")` then `M.client(url, opts)`.
 
 | Module               | Description                                                                                                                                                      |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -635,7 +654,7 @@ hardcode credentials in scripts.
 **Shebang scripts**: Add `#!/usr/bin/assay` as the first line and `chmod +x script.lua` to run
 scripts directly without the `assay` prefix.
 
-**Module not found**: All 63 stdlib modules are embedded in the binary. If `require("assay.foo")`
+**Module not found**: All 66 stdlib modules are embedded in the binary. If `require("assay.foo")`
 fails, run `assay modules` to see the exact module names.
 
 **Lua 5.5 specifics**: Assay uses Lua 5.5 (not LuaJIT). Integer division is `//`, bitwise ops use

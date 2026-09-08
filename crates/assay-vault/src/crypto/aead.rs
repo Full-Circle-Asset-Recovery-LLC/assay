@@ -71,9 +71,7 @@ pub fn decrypt(
 /// tolerates nonce reuse (that's the whole point of the SIV mode), so
 /// we don't need the strict nonce-counter discipline plain GCM wants.
 pub fn random_nonce() -> [u8; NONCE_LEN] {
-    let mut n = [0u8; NONCE_LEN];
-    rand::rng().fill_bytes(&mut n);
-    n
+    rand::random()
 }
 
 /// Random 32-byte data-encryption key (DEK). Generated per KV record

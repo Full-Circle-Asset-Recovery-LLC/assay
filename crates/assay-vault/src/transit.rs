@@ -104,7 +104,7 @@ impl<S: TransitStore> TransitService<S> {
     /// uses AES-256-GCM-SIV regardless of the value.
     pub async fn create_key(&self, name: &str, algo: Option<&str>) -> Result<()> {
         validate_name(name)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let dek = random_dek();
         let wrapped = kek.wrap_dek(&dek)?;
         let algo = algo.unwrap_or("aes256-gcm-siv");
@@ -118,7 +118,7 @@ impl<S: TransitStore> TransitService<S> {
     /// Returns the wire-format ciphertext (`vault:vN:b64...`).
     pub async fn encrypt(&self, name: &str, plaintext: &[u8]) -> Result<String> {
         validate_name(name)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let v = self
             .store
             .get_latest_version(name)
@@ -136,7 +136,7 @@ impl<S: TransitStore> TransitService<S> {
     /// current latest), and runs AEAD-decrypt.
     pub async fn decrypt(&self, name: &str, envelope: &str) -> Result<Vec<u8>> {
         validate_name(name)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let parts = parse_envelope(envelope)?;
         let v = self
             .store
@@ -151,7 +151,7 @@ impl<S: TransitStore> TransitService<S> {
     /// Append a new version to `name`. Returns the new version number.
     pub async fn rotate(&self, name: &str) -> Result<i64> {
         validate_name(name)?;
-        let kek = self.seal_state.require_unsealed()?;
+        let (_operation, kek) = self.seal_state.begin_operation().await?;
         let dek = random_dek();
         let wrapped = kek.wrap_dek(&dek)?;
         self.store.rotate(name, wrapped.as_bytes(), kek.kid()).await

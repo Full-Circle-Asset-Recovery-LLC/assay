@@ -130,7 +130,10 @@ pub struct SqliteBoot {
 
 impl EngineBoot {
     /// Run the boot sequence end-to-end against the configured backend.
-    pub async fn run(cfg: &EngineConfig) -> anyhow::Result<Self> {
+    pub async fn run(
+        cfg: &EngineConfig,
+        runtime_authority: Option<&Arc<crate::process_lock::RuntimeAuthority>>,
+    ) -> anyhow::Result<Self> {
         match cfg.backend.clone() {
             #[cfg(feature = "backend-postgres")]
             BackendConfig::Postgres { url } => {
@@ -143,7 +146,8 @@ impl EngineBoot {
                     .backend
                     .sqlite_data_dir()
                     .expect("sqlite backend yields data_dir");
-                let boot = sqlite_boot(&data_dir, &cfg.auto_enable_modules).await?;
+                let boot =
+                    sqlite_boot(&data_dir, &cfg.auto_enable_modules, runtime_authority).await?;
                 Ok(EngineBoot::Sqlite(boot))
             }
             #[allow(unreachable_patterns)]
@@ -195,14 +199,32 @@ async fn pg_boot(url: &str, auto_enable: &[String]) -> anyhow::Result<PgBoot> {
     // the store — Phase 2 already moved those tables into the `workflow`
     // schema. We just ensure the schema container exists here so a fresh
     // boot doesn't fail before the store's CREATE TABLE runs.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| anyhow::anyhow!("begin module schema tx: {e}"))?;
+    assay_domain::engine::acquire_schema_lock(&mut tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("acquire schema migration advisory lock: {e}"))?;
     for name in &modules {
         let create = format!("CREATE SCHEMA IF NOT EXISTS {name}");
         sqlx::query(&create)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| anyhow::anyhow!("create schema {name}: {e}"))?;
-        record_engine_migration_pg(&pool, name, 1).await?;
+        sqlx::query(
+            "INSERT INTO engine.migrations (module, version)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(name)
+        .bind(1)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("record engine.migrations row {name}/1: {e}"))?;
     }
+    tx.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("commit module schema tx: {e}"))?;
 
     // Auth schema migration — always runs (auth is mandatory per
     // boot) and smoke-touches the OIDC provider tables so missing DDL or
@@ -336,63 +358,15 @@ fn spawn_pg_instance_lifecycle(pool: sqlx::PgPool, id: uuid::Uuid) {
 }
 
 #[cfg(feature = "backend-sqlite")]
-async fn sqlite_boot(data_dir: &str, auto_enable: &[String]) -> anyhow::Result<SqliteBoot> {
+async fn sqlite_boot(
+    data_dir: &str,
+    auto_enable: &[String],
+    runtime_authority: Option<&Arc<crate::process_lock::RuntimeAuthority>>,
+) -> anyhow::Result<SqliteBoot> {
     use assay_domain::engine::SqliteEngineSchema;
     use assay_domain::events::SqliteEngineEventBus;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
 
-    let in_memory = data_dir == ":memory:";
-    if !in_memory {
-        std::fs::create_dir_all(data_dir)
-            .map_err(|e| anyhow::anyhow!("create data_dir {data_dir}: {e}"))?;
-    }
-
-    // The connection's "main" is a transient in-memory router. All real
-    // tables live in ATTACHed databases so engine-qualified queries
-    // (`engine.events`, `workflow.workflows`) match the PG syntax exactly.
-    let main_url = "sqlite::memory:";
-    let opts = SqliteConnectOptions::from_str(main_url)?.create_if_missing(true);
-
-    let engine_attach = sqlite_attach_uri(data_dir, "engine", in_memory);
-    let workflow_attach = sqlite_attach_uri(data_dir, "workflow", in_memory);
-    let auth_attach = sqlite_attach_uri(data_dir, "auth", in_memory);
-    #[cfg(feature = "vault")]
-    let vault_attach = sqlite_attach_uri(data_dir, "vault", in_memory);
-
-    info!(
-        target: "assay-engine",
-        data_dir = %data_dir,
-        engine = %engine_attach,
-        workflow = %workflow_attach,
-        "boot: opening sqlite engine pool"
-    );
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .after_connect(move |conn, _meta| {
-            let engine_attach = engine_attach.clone();
-            let workflow_attach = workflow_attach.clone();
-            let auth_attach = auth_attach.clone();
-            #[cfg(feature = "vault")]
-            let vault_attach = vault_attach.clone();
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute(format!("ATTACH DATABASE '{engine_attach}' AS engine").as_str())
-                    .await?;
-                conn.execute(format!("ATTACH DATABASE '{workflow_attach}' AS workflow").as_str())
-                    .await?;
-                conn.execute(format!("ATTACH DATABASE '{auth_attach}' AS auth").as_str())
-                    .await?;
-                #[cfg(feature = "vault")]
-                conn.execute(format!("ATTACH DATABASE '{vault_attach}' AS vault").as_str())
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(opts)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect sqlite: {e}"))?;
+    let pool = sqlite_pool(data_dir).await?;
 
     let schema = SqliteEngineSchema::new(pool.clone());
     schema
@@ -442,7 +416,11 @@ async fn sqlite_boot(data_dir: &str, auto_enable: &[String]) -> anyhow::Result<S
         .register_instance(&modules, Some(env!("CARGO_PKG_VERSION")))
         .await
         .map_err(|e| anyhow::anyhow!("register engine.instances row: {e}"))?;
-    spawn_sqlite_instance_lifecycle(pool.clone(), instance_id);
+    spawn_sqlite_instance_lifecycle(
+        pool.clone(),
+        instance_id,
+        runtime_authority.map(|authority| authority.task_guard()),
+    );
 
     info!(target: "assay-engine", instance = %instance_id, modules = ?modules, "boot complete (sqlite)");
     Ok(SqliteBoot {
@@ -452,6 +430,61 @@ async fn sqlite_boot(data_dir: &str, auto_enable: &[String]) -> anyhow::Result<S
         modules,
     })
 }
+
+/// Open the engine's SQLite store: an in-memory router connection with
+/// one ATTACHed database per module, so engine-qualified queries read
+/// the same on both backends. Shared with the store-migration command.
+#[cfg(feature = "backend-sqlite")]
+pub(crate) async fn sqlite_pool(data_dir: &str) -> anyhow::Result<sqlx::SqlitePool> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    let in_memory = data_dir == ":memory:";
+    if !in_memory {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| anyhow::anyhow!("create data_dir {data_dir}: {e}"))?;
+    }
+
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.create_if_missing(true);
+    let attachments: Vec<(&str, String)> = SQLITE_MODULE_DBS
+        .iter()
+        .map(|m| (*m, sqlite_attach_uri(data_dir, m, in_memory)))
+        .collect();
+
+    info!(
+        target: "assay-engine",
+        data_dir = %data_dir,
+        modules = ?SQLITE_MODULE_DBS,
+        "opening sqlite engine pool"
+    );
+
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let attachments = attachments.clone();
+            Box::pin(async move {
+                use sqlx::Executor;
+                for (name, uri) in attachments {
+                    conn.execute(format!("ATTACH DATABASE '{uri}' AS {name}").as_str())
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .connect_with(opts)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect sqlite: {e}"))
+}
+
+/// Module databases ATTACHed into the SQLite router, in ATTACH order.
+#[cfg(feature = "backend-sqlite")]
+pub(crate) const SQLITE_MODULE_DBS: &[&str] = &[
+    "engine",
+    "workflow",
+    "auth",
+    #[cfg(feature = "vault")]
+    "vault",
+];
 
 #[cfg(feature = "backend-sqlite")]
 fn sqlite_attach_uri(data_dir: &str, module: &str, in_memory: bool) -> String {
@@ -529,13 +562,25 @@ async fn record_engine_migration_sqlite(
 }
 
 #[cfg(feature = "backend-sqlite")]
-fn spawn_sqlite_instance_lifecycle(pool: sqlx::SqlitePool, id: uuid::Uuid) {
+fn spawn_sqlite_instance_lifecycle(
+    pool: sqlx::SqlitePool,
+    id: uuid::Uuid,
+    runtime_guard: Option<crate::process_lock::RuntimeTaskGuard>,
+) {
     use assay_domain::engine::SqliteEngineSchema;
     let schema = SqliteEngineSchema::new(pool);
     tokio::spawn(async move {
+        let mut runtime_guard = runtime_guard;
         let mut tick = tokio::time::interval(Duration::from_secs(INSTANCE_HEARTBEAT_SECS));
         loop {
-            tick.tick().await;
+            if let Some(guard) = runtime_guard.as_mut() {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = guard.cancelled() => break,
+                }
+            } else {
+                tick.tick().await;
+            }
             if let Err(e) = schema.heartbeat_instance(id).await {
                 tracing::warn!(?e, %id, "engine.instances heartbeat failed");
             }
@@ -553,7 +598,7 @@ mod tests {
     /// first boot now.
     #[tokio::test(flavor = "multi_thread")]
     async fn sqlite_boot_default_runs_auth_migration() {
-        let boot = sqlite_boot(":memory:", &[]).await.expect("boot");
+        let boot = sqlite_boot(":memory:", &[], None).await.expect("boot");
         assert!(
             boot.modules.iter().any(|m| m == "auth"),
             "auth must be in active modules by default; got {:?}",
