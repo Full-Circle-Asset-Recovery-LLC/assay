@@ -179,6 +179,7 @@ jobs:
           # Full history keeps moon's project graph and VCS metadata
           # available for any selected target.
           fetch-depth: 0
+          persist-credentials: false
 
       # .mise.toml is the single source of truth for tool versions.
       # Pinning mise itself avoids a flaky `latest` CDN failure
@@ -267,11 +268,11 @@ jobs:
           key: ${{ hashFiles('**/Cargo.lock') }}
           cache-all-crates: "true"
           cache-targets: "true"
-          # Save the cache only on PR runs (Swatinem/rust-cache already
-          # gates internally on job success). Avoids re-uploading ~250MB
-          # for non-PR contexts. `success()` cannot appear in `with:`
-          # inputs — it's restricted to `if:` of jobs/steps.
+          # Save the cache only on PR runs, including failed late test
+          # runs, so a source fix can reuse the completed compilation.
+          # Avoids re-uploading ~250MB for non-PR contexts.
           save-if: ${{ github.event_name == 'pull_request' }}
+          cache-on-failure: "true"
 
       # Shared Postgres for Ubuntu only. `services:` can't be conditional
       # in a matrix and macOS GH runners have no Docker. Starting PG once
