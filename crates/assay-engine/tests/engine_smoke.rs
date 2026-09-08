@@ -396,7 +396,7 @@ async fn engine_smoke_sqlite() {
     // flow is admin-key gated; this proves the Phase-3 routes exist and
     // round-trip through the full PG/SQLite path.
     drop(engine);
-    let engine2 = EngineProcess::spawn();
+    let mut engine2 = EngineProcess::spawn();
     let client2 = reqwest::Client::builder()
         // 30s — generous: Argon2id (m=64 MiB, t=3, p=4) on a slow CI
         // runner can take 2-3s per hash; the BW register/verify path
