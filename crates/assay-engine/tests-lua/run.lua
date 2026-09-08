@@ -15,10 +15,12 @@ local ENGINE_BIN = env.get("ASSAY_ENGINE_BIN") or ROOT .. "/target/release/assay
 local PORT = tonumber(env.get("ASSAY_ENGINE_LUA_PORT") or env.get("ASSAY_E2E_PORT") or "18420")
 local BASE = "http://127.0.0.1:" .. tostring(PORT)
 local ADMIN_KEY = env.get("ASSAY_ENGINE_LUA_ADMIN_KEY") or ("lua-tests-key-" .. tostring(time()))
-local DATA_DIR = fs.tempdir()
-local ENGINE_TOML = DATA_DIR .. "/engine.toml"
-local ENGINE_LOG = DATA_DIR .. "/engine.log"
-local WORKER_LOG = DATA_DIR .. "/worker.log"
+local FIXTURE_ROOT
+local TMP_ROOT
+local DATA_DIR
+local ENGINE_TOML
+local ENGINE_LOG
+local WORKER_LOG
 
 local engine_pid
 local worker_pid
@@ -27,7 +29,54 @@ local function say(msg)
   print("==> " .. msg)
 end
 
+local function shell_quote(value)
+  return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function create_private_data_dir()
+  local tmp = shell.exec("cd /tmp && pwd -P")
+  if tmp.status ~= 0 then
+    error("unable to resolve the temporary directory: " .. (tmp.stderr or ""))
+  end
+  TMP_ROOT = (tmp.stdout or ""):gsub("%s+$", "")
+
+  local result = shell.exec("mktemp -d /tmp/assay-engine-lua.XXXXXX")
+  if result.status ~= 0 then
+    error("unable to create private fixture directory: " .. (result.stderr or ""))
+  end
+
+  local created = (result.stdout or ""):gsub("%s+$", "")
+  local canonical = shell.exec("cd " .. shell_quote(created) .. " && pwd -P")
+  if canonical.status ~= 0 then
+    error("unable to resolve the fixture directory: " .. (canonical.stderr or ""))
+  end
+  FIXTURE_ROOT = (canonical.stdout or ""):gsub("%s+$", "")
+  local expected_prefix = TMP_ROOT .. "/assay-engine-lua."
+  if FIXTURE_ROOT:sub(1, #expected_prefix) ~= expected_prefix
+      or not FIXTURE_ROOT:sub(#expected_prefix + 1):match("^[%w]+$") then
+    error("mktemp returned an unexpected fixture path")
+  end
+
+  -- ProcessLock requires the data directory's immediate parent to be private
+  -- to the current operator. Keep SQLite beneath the unique 0700 fixture root.
+  DATA_DIR = FIXTURE_ROOT .. "/data"
+  ENGINE_TOML = FIXTURE_ROOT .. "/engine.toml"
+  ENGINE_LOG = FIXTURE_ROOT .. "/engine.log"
+  WORKER_LOG = FIXTURE_ROOT .. "/worker.log"
+  local setup = shell.exec(
+    "chmod 0700 " .. shell_quote(FIXTURE_ROOT)
+      .. " && mkdir -m 0700 " .. shell_quote(DATA_DIR)
+  )
+  if setup.status ~= 0 then
+    error("unable to secure fixture directory: " .. (setup.stderr or ""))
+  end
+end
+
 local function tail(path, max_lines)
+  if not path then
+    print("  <log path unavailable>")
+    return
+  end
   local ok, body = pcall(fs.read, path)
   if not ok or not body then
     print("  <unable to read " .. path .. ">")
@@ -48,7 +97,11 @@ local function cleanup()
   if engine_pid then pcall(process.kill, engine_pid) end
   if worker_pid then pcall(process.wait, worker_pid, { timeout = 3 }) end
   if engine_pid then pcall(process.wait, engine_pid, { timeout = 3 }) end
-  pcall(fs.remove, DATA_DIR)
+  local expected_prefix = TMP_ROOT and (TMP_ROOT .. "/assay-engine-lua.") or ""
+  if FIXTURE_ROOT and FIXTURE_ROOT:sub(1, #expected_prefix) == expected_prefix
+      and FIXTURE_ROOT:sub(#expected_prefix + 1):match("^[%w]+$") then
+    pcall(shell.exec, "rm -rf -- " .. shell_quote(FIXTURE_ROOT))
+  end
 end
 
 local function write_engine_config()
@@ -98,6 +151,7 @@ local function run_process(label, opts, timeout)
 end
 
 local ok, err = pcall(function()
+  create_private_data_dir()
   write_engine_config()
 
   say("starting engine on port " .. tostring(PORT))
