@@ -1004,6 +1004,10 @@ async fn output_parent_swap_cannot_redirect_anchored_bundle_publication() {
 async fn offline_init_replaces_plaintext_once_and_writes_private_bundle() {
     let (_tmp, config, pool) = fixture().await;
     let out = config.parent().unwrap().join("shares.json");
+    let old_kid: String = sqlx::query_scalar("SELECT kid FROM vault.kek_metadata")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let old_kek: Vec<u8> = sqlx::query_scalar("SELECT sealed_blob FROM vault.kek_metadata")
         .fetch_one(&pool)
         .await
@@ -1030,6 +1034,11 @@ async fn offline_init_replaces_plaintext_once_and_writes_private_bundle() {
         String::from_utf8_lossy(&result.stderr)
     );
     let stdout = String::from_utf8(result.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        format!("shamir initialized: path={} shares=5\n", out.display())
+    );
+    assert!(!stdout.contains(&old_kid));
     assert!(!stdout.contains("shares_b64"));
     assert_eq!(
         std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,

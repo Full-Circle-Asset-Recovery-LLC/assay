@@ -459,12 +459,11 @@ async fn main() -> ExitCode {
         )
         .await
         {
-            Ok(kid) => {
+            Ok(_) => {
                 println!(
-                    "shamir initialized: path={} shares={} kid={}",
+                    "shamir initialized: path={} shares={}",
                     shares_out.display(),
-                    shares,
-                    kid
+                    shares
                 );
                 ExitCode::SUCCESS
             }
