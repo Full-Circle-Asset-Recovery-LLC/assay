@@ -5,11 +5,65 @@ if [[ $# -ne 1 ]]; then
   echo "usage: $0 DESTINATION_DIRECTORY" >&2
   exit 2
 fi
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  manifest="$script_dir/assay-engine-v0.5.15-darwin-aarch64.json"
+  metadata=()
+  while IFS= read -r value; do
+    metadata+=("$value")
+  done < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+values = (
+    manifest["distribution"]["url"],
+    manifest["artifact"]["asset_name"],
+    manifest["artifact"]["sha256"],
+    str(manifest["artifact"]["size_bytes"]),
+    manifest["artifact"]["version_output"],
+)
+print("\n".join(values))
+PY
+  )
+  if [[ ${#metadata[@]} -ne 5 ]]; then
+    echo "Darwin baseline manifest did not yield the required metadata" >&2
+    exit 1
+  fi
+  scratch="$(mktemp -d)"
+  trap 'rm -rf -- "$scratch"' EXIT
+  download="$scratch/${metadata[1]}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
+    "${metadata[0]}" >"$download"
+  actual_size="$(wc -c <"$download" | tr -d '[:space:]')"
+  actual_sha256="$(shasum -a 256 "$download" | awk '{print $1}')"
+  if [[ "$actual_size" != "${metadata[3]}" ]]; then
+    echo "baseline size mismatch: expected ${metadata[3]}, got $actual_size" >&2
+    exit 1
+  fi
+  if [[ "$actual_sha256" != "${metadata[2]}" ]]; then
+    echo "baseline sha256 mismatch: expected ${metadata[2]}, got $actual_sha256" >&2
+    exit 1
+  fi
+  destination="$(mkdir -p "$1" && cd "$1" && pwd -P)"
+  chmod 0700 "$destination"
+  installed="$destination/assay-engine-v0.5.15"
+  install -m 0500 "$download" "$installed"
+  actual_version="$("$installed" --version)"
+  if [[ "$actual_version" != "${metadata[4]}" ]]; then
+    echo "baseline version mismatch: expected '${metadata[4]}', got '$actual_version'" >&2
+    exit 1
+  fi
+  printf '%s\n' "$installed"
+  exit 0
+fi
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-  echo "assay-engine v0.5.15 baseline is available only for x86_64 Linux" >&2
+  echo "assay-engine v0.5.15 baseline is available only for x86_64 Linux or arm64 Darwin" >&2
   exit 1
 fi
-script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 manifest="$script_dir/assay-engine-v0.5.15-linux-x86_64.json"
 mapfile -t metadata < <(python3 - "$manifest" <<'PY'
 import json

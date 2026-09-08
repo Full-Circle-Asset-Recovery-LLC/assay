@@ -17,8 +17,12 @@ use clap::Parser;
 
 const TRUSTED_BASELINE_VERSION: &str = "0.5.15";
 const TRUSTED_BASELINE_SOURCE_COMMIT: &str = "3977f552391917874589530d0d23094559e68e29";
+#[cfg(not(target_os = "macos"))]
 const TRUSTED_BASELINE_SHA256: &str =
     "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+#[cfg(target_os = "macos")]
+const TRUSTED_BASELINE_SHA256: &str =
+    "b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1024,8 +1028,7 @@ fn validate_checkpointed_sqlite_generation(data_dir: &std::path::Path) -> anyhow
 fn trusted_operator_id() -> anyhow::Result<String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!("uid:{}", std::fs::metadata("/proc/self")?.uid()))
+        Ok(format!("uid:{}", unsafe { libc::geteuid() }))
     }
     #[cfg(not(unix))]
     anyhow::bail!("offline Shamir initialization requires an OS-derived operator identity")
@@ -1154,7 +1157,7 @@ fn validate_share_output_parent(shares_out: &std::path::Path) -> anyhow::Result<
     }
     #[cfg(unix)]
     {
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = unsafe { libc::geteuid() };
         if metadata.uid() != operator_uid {
             anyhow::bail!("--shares-out parent must be owned by the operator");
         }
@@ -1207,7 +1210,7 @@ fn validate_backup_manifest(
     {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(manifest_path)?;
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = unsafe { libc::geteuid() };
         if metadata.uid() != operator_uid || metadata.mode() & 0o077 != 0 {
             anyhow::bail!("--backup-manifest must be operator-owned and private");
         }
@@ -1314,7 +1317,7 @@ fn validate_private_backup_artifact(path: &std::path::Path, label: &str) -> anyh
     let parent_metadata = std::fs::symlink_metadata(parent)?;
     #[cfg(unix)]
     {
-        let operator_uid = std::fs::metadata("/proc/self")?.uid();
+        let operator_uid = unsafe { libc::geteuid() };
         if metadata.uid() != operator_uid || metadata.mode() & 0o077 != 0 {
             anyhow::bail!("{label} must be operator-owned and mode 0600 or stricter");
         }

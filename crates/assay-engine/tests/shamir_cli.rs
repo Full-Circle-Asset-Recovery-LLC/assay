@@ -8,18 +8,17 @@ use assay_vault::crypto::kek_store::load_or_init_sqlite;
 use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+#[cfg(not(target_os = "macos"))]
 const BASELINE_V0515_SHA256: &str =
     "eebe897ff3868fce51724931b98cff9e09c241294ed3dc46a3d8e8813a68657a";
+#[cfg(target_os = "macos")]
+const BASELINE_V0515_SHA256: &str =
+    "b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0";
 
 fn sha256(path: &std::path::Path) -> String {
-    let output = Command::new("sha256sum").arg(path).output().unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned()
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).unwrap();
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn write_backup_manifest(config: &std::path::Path) -> std::path::PathBuf {
@@ -112,8 +111,7 @@ fn authorized_command(config: &std::path::Path, out: &std::path::Path) -> Comman
 }
 
 fn trusted_operator_id() -> String {
-    use std::os::unix::fs::MetadataExt;
-    format!("uid:{}", std::fs::metadata("/proc/self").unwrap().uid())
+    format!("uid:{}", unsafe { libc::geteuid() })
 }
 
 fn journal_path(out: &std::path::Path) -> std::path::PathBuf {

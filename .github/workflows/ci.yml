@@ -233,13 +233,13 @@ jobs:
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true'
         run: rustup component add clippy rustfmt
 
-      # The Shamir transition suite proves migration from the exact deployed
-      # v0.5.15 engine. That binary predates this branch and cannot be rebuilt
-      # from the candidate source. Fetch the deployment-attested artifact from
-      # an immutable fixture commit, then fail closed on compressed and raw
-      # byte length, digest, ELF build ID, or reported version drift.
-      - name: Install pinned assay-engine v0.5.15 baseline (Linux)
-        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux'
+      # The Shamir transition suite proves migration from the target's exact
+      # v0.5.15 engine. Those binaries predate this branch and cannot be rebuilt
+      # from candidate source. The installer selects the target manifest and
+      # fails closed on the published size, digest, and reported version. Linux
+      # additionally verifies the immutable fixture archive and ELF build ID.
+      - name: Install pinned assay-engine v0.5.15 baseline
+        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true'
         run: |
           baseline=$(.github/ci/install-assay-engine-baseline.sh "$RUNNER_TEMP/assay-baseline")
           echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"
