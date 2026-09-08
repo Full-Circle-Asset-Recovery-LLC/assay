@@ -14,6 +14,20 @@ const SECRET: &str = "sealed-secret-value";
 const SEAL_KEY_A: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 const SEAL_KEY_B: &str = "/v79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=";
 
+fn fixture() -> tempfile::TempDir {
+    let parent = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temp root");
+    let dir = tempfile::tempdir_in(parent).expect("tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+    }
+    dir
+}
+
 fn backend(data_dir: &Path) -> String {
     format!(
         "[backend]\ntype = \"sqlite\"\ndata_dir = \"{}\"",
@@ -73,7 +87,7 @@ async fn read_secret(dir: &Path, data_dir: &Path, tag: &str, seal: Option<&str>)
 /// With no seal key the KEK stays raw in the store, as it always has.
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_seal_key_the_kek_is_stored_in_the_clear() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = fixture();
     let data = dir.path().join("data");
     write_secret(dir.path(), &data, "plain", None).await;
 
@@ -86,7 +100,7 @@ async fn without_a_seal_key_the_kek_is_stored_in_the_clear() {
 /// opens it again on the next boot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_seal_key_encrypts_the_kek_and_still_opens_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = fixture();
     let data = dir.path().join("data");
     write_secret(dir.path(), &data, "sealed", Some(SEAL_KEY_A)).await;
 
@@ -106,7 +120,7 @@ async fn a_seal_key_encrypts_the_kek_and_still_opens_it() {
 /// key, and its existing secrets still decrypt.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_existing_plaintext_store_is_resealed_and_keeps_its_secrets() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = fixture();
     let data = dir.path().join("data");
     write_secret(dir.path(), &data, "before", None).await;
     let (method, _) = kek_row(&data).await;
@@ -132,7 +146,7 @@ async fn an_existing_plaintext_store_is_resealed_and_keeps_its_secrets() {
 /// second KEK and orphan every secret the first one wraps.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sealed_store_refuses_to_boot_without_the_right_key() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = fixture();
     let data = dir.path().join("data");
     write_secret(dir.path(), &data, "locked", Some(SEAL_KEY_A)).await;
 

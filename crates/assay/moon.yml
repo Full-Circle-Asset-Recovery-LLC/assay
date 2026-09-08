@@ -84,7 +84,7 @@ tasks:
       runInCI: true
 
   test:
-    command: "cargo test --workspace"
+    command: "cargo test --workspace --no-fail-fast"
     inputs:
       - "@group(rust-sources)"
       - "tests/**/*"
