@@ -1,0 +1,96 @@
+name: Engine backport
+
+on:
+  pull_request:
+    branches: [maintenance/engine-0.5.15]
+  push:
+    branches: [maintenance/engine-0.5.15]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-backport-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Engine backport PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 18]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify deployed baseline ancestry
+        run: git merge-base --is-ancestor 3977f552391917874589530d0d23094559e68e29 HEAD
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: engine-backport-${{ matrix.postgres }}
+      - name: Verify scheduler invariants against required PostgreSQL
+        run: cargo test --locked -p assay-workflow --test postgres_scheduler_lock -- --test-threads=1
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check workflow and engine warnings
+        run: cargo clippy --locked -p assay-workflow -p assay-engine --all-targets -- -D warnings
+      - name: Verify workflow and engine contracts
+        run: cargo test --locked -p assay-workflow -p assay-engine
+
+  package:
+    name: Verified engine artifact
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify deployed baseline ancestry
+        run: git merge-base --is-ancestor 3977f552391917874589530d0d23094559e68e29 HEAD
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: engine-backport-release
+      - name: Build engine from exact accepted source
+        run: cargo build --locked --release -p assay-engine --bin assay-engine
+      - name: Package immutable engine artifact
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_ENGINE_VERSION: 0.5.15+schedule.1
+        run: python3 .github/release/package-engine-backport.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-backport-${{ github.sha }}
+          path: dist/engine-backport/
+          if-no-files-found: error
+          retention-days: 30
