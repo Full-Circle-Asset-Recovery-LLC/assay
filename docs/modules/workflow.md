@@ -660,3 +660,13 @@ assay workflow wait deploy-1234 --timeout 300   # exit 0 on COMPLETED, 1 on fail
 - Default `assay-engine` builds include S3 archival as of v0.5.6, but it is a runtime no-op unless
   `ASSAY_ARCHIVE_S3_BUCKET` is set. Custom `assay-workflow` embedders opt in with the default-off
   `s3-archival` cargo feature.
+
+### PostgreSQL scheduler connection ownership
+
+The 0.5.15+schedule.1 maintenance engine keeps scheduler advisory lock 42 on a
+dedicated PostgreSQL connection shared by clones of one store. Data-pool traffic
+cannot move its leadership check to another session. Connection establishment and
+ownership queries have bounded waits; failed sessions are discarded before a
+later tick may compete for leadership again. Dropping the final store clone closes
+the dedicated connection. This fixes pool-induced missed ticks; it does not provide
+transactional fencing across an entire schedule evaluation pass.

@@ -550,8 +550,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
+          # The engine-only maintenance branch preserves its deployed API baseline;
+          # later registry releases may contain APIs outside that source lineage.
+          baseline-rev: ${{ github.base_ref == 'maintenance/engine-0.5.15' && '3977f552391917874589530d0d23094559e68e29' || '' }}
           # assay-authz has no crates.io release to diff against yet, and
           # the tool errors rather than skipping on a missing baseline.
           # Drop this once its first version is published.
