@@ -1,5 +1,13 @@
 # Changelog
 
+## Engine 0.5.15+schedule.1 / workflow 0.4.5 — 2026-09-12
+
+- Keep PostgreSQL scheduler leadership on a dedicated connection shared by store clones, so data-pool churn does not skip due schedule checks.
+- Bound connection and ownership checks; discard failed sessions and release ownership when the final store clone drops.
+- Add PostgreSQL 16 and 18 regressions for pool pressure, clone lifetime, competing schedulers, and connection loss.
+- This maintenance build preserves the 0.5.15 engine baseline. Its build metadata identifies the backport; consumers select its explicit artifact and checksum. It does not add transactional fencing across a complete schedule pass.
+
+
 All notable changes to Assay are documented here.
 
 ## assay-engine 0.5.15 — 2026-08-20

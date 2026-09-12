@@ -1,11 +1,17 @@
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 use crate::store::{RetryEvent, WorkflowStore, retry_denial};
 use crate::types::*;
 
 const RETRY_ACTIVITY_SELECT: &str = "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat FROM workflow.activities WHERE workflow_id = $1 AND status = 'FAILED' ORDER BY seq DESC LIMIT 1 FOR UPDATE";
 const RETRY_ACTIVITY_UPDATE: &str = "UPDATE workflow.activities SET status = 'PENDING', result = NULL, error = NULL, attempt = 1, claimed_by = NULL, scheduled_at = $1, started_at = NULL, completed_at = NULL, last_heartbeat = NULL WHERE id = $2 RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat";
+const SCHEDULER_LOCK_KEY: i64 = 42;
+const SCHEDULER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SCHEDULER_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// v0.1.2 schema layout: workflow tables live in the `workflow` schema;
 /// the engine-events outbox lives in the `engine` schema (created
@@ -299,14 +305,13 @@ fn sanitise_schema(schema: &str) -> Vec<String> {
         .collect()
 }
 
-/// `Clone` is derived because the underlying `PgPool` is itself `Clone`
-/// (it's `Arc<PoolInner>` internally) — cloning the store hands back a
-/// new wrapper around the same connection pool. Required so engine
-/// composition (`EngineState<S>`) can derive `Clone` and pass through
-/// axum `with_state`.
+/// Clones share the data pool and the dedicated scheduler-lock connection.
+/// The scheduler session is never returned to the data pool, and its socket is
+/// closed when the final store clone drops.
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    scheduler_connection: Arc<Mutex<Option<PgConnection>>>,
 }
 
 impl PostgresStore {
@@ -320,7 +325,10 @@ impl PostgresStore {
     /// modules) and hands a clone to the workflow module, or for tests that
     /// point many stores at different databases in the same Postgres server.
     pub async fn from_pool(pool: PgPool) -> Result<Self> {
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            scheduler_connection: Arc::new(Mutex::new(None)),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -1468,13 +1476,82 @@ impl WorkflowStore for PostgresStore {
     // ── Leader Election ─────────────────────────────────────
 
     async fn try_acquire_scheduler_lock(&self) -> Result<bool> {
-        // pg_try_advisory_lock is session-scoped — only one connection
-        // in the pool will hold the lock. In a multi-replica Kubernetes
-        // deployment, only one pod's connection wins.
-        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock(42)")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0)
+        let mut scheduler_connection =
+            tokio::time::timeout(SCHEDULER_CHECK_TIMEOUT, self.scheduler_connection.lock())
+                .await
+                .map_err(|_| anyhow::anyhow!("scheduler connection lock timed out"))?;
+
+        let existing_connection = scheduler_connection.is_some();
+        if scheduler_connection.is_none() {
+            let options = self.pool.connect_options();
+            let connected = tokio::time::timeout(
+                SCHEDULER_CONNECT_TIMEOUT,
+                PgConnection::connect_with(options.as_ref()),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("scheduler database connection timed out"))?;
+            *scheduler_connection = Some(connected?);
+        }
+
+        let connection = scheduler_connection
+            .as_mut()
+            .expect("scheduler connection was initialized");
+
+        if existing_connection {
+            let ownership = tokio::time::timeout(
+                SCHEDULER_CHECK_TIMEOUT,
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE locktype = 'advisory'
+                          AND pid = pg_backend_pid()
+                          AND classid = 0
+                          AND objid = 42
+                          AND objsubid = 1
+                          AND granted
+                    )",
+                )
+                .fetch_one(&mut *connection),
+            )
+            .await;
+
+            match ownership {
+                Ok(Ok(true)) => return Ok(true),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    scheduler_connection.take();
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    scheduler_connection.take();
+                    return Err(anyhow::anyhow!(
+                        "scheduler ownership check timed out: {error}"
+                    ));
+                }
+            }
+        }
+
+        let acquired = tokio::time::timeout(
+            SCHEDULER_CHECK_TIMEOUT,
+            sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(SCHEDULER_LOCK_KEY)
+                .fetch_one(&mut *connection),
+        )
+        .await;
+
+        match acquired {
+            Ok(Ok(acquired)) => Ok(acquired),
+            Ok(Err(error)) => {
+                scheduler_connection.take();
+                Err(error.into())
+            }
+            Err(error) => {
+                scheduler_connection.take();
+                Err(anyhow::anyhow!(
+                    "scheduler advisory lock timed out: {error}"
+                ))
+            }
+        }
     }
 }
 
