@@ -1,3 +1,5 @@
+mod activity_reports;
+
 use anyhow::Result;
 use sqlx::PgPool;
 
@@ -318,6 +320,10 @@ impl PostgresStore {
 }
 
 impl WorkflowStore for PostgresStore {
+    fn supports_activity_due_time_claims(&self) -> bool {
+        true
+    }
+
     // ── Namespaces ─────────────────────────────────────────
 
     async fn create_namespace(&self, name: &str) -> Result<()> {
@@ -608,6 +614,13 @@ impl WorkflowStore for PostgresStore {
     // ── Events ─────────────────────────────────────────────
 
     async fn append_event(&self, ev: &WorkflowEvent) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        if ev.event_type == "WorkflowCancelRequested" {
+            sqlx::query("SELECT id FROM workflow.workflows WHERE id = $1 FOR UPDATE")
+                .bind(&ev.workflow_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO workflow.events (workflow_id, seq, event_type, payload, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
@@ -616,8 +629,9 @@ impl WorkflowStore for PostgresStore {
         .bind(&ev.event_type)
         .bind(&ev.payload)
         .bind(ev.timestamp)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.0)
     }
 
@@ -736,26 +750,7 @@ impl WorkflowStore for PostgresStore {
         task_queue: &str,
         worker_id: &str,
     ) -> Result<Option<WorkflowActivity>> {
-        let now = timestamp_now();
-        // Atomic claim using FOR UPDATE SKIP LOCKED — prevents contention
-        // between multiple assay serve instances claiming the same activity
-        let row = sqlx::query_as::<_, PgActivityRow>(
-            "UPDATE workflow.activities SET status = 'RUNNING', claimed_by = $1, started_at = $2
-             WHERE id = (
-                SELECT id FROM workflow.activities
-                WHERE task_queue = $3 AND status = 'PENDING'
-                ORDER BY scheduled_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-             )
-             RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat",
-        )
-        .bind(worker_id)
-        .bind(now)
-        .bind(task_queue)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(Into::into))
+        self.claim_due_activity(task_queue, worker_id).await
     }
 
     async fn requeue_activity_for_retry(
@@ -764,19 +759,8 @@ impl WorkflowStore for PostgresStore {
         next_attempt: i32,
         next_scheduled_at: f64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE workflow.activities
-             SET status = 'PENDING', attempt = $1, scheduled_at = $2,
-                 claimed_by = NULL, started_at = NULL, last_heartbeat = NULL,
-                 error = NULL
-             WHERE id = $3",
-        )
-        .bind(next_attempt)
-        .bind(next_scheduled_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.retry_activity_cas(id, next_attempt, next_scheduled_at)
+            .await
     }
 
     async fn retry_failed_activity(
@@ -903,6 +887,15 @@ impl WorkflowStore for PostgresStore {
 
     async fn settle_activity(&self, settlement: &ActivitySettlement<'_>) -> Result<SettleOutcome> {
         let mut tx = self.pool.begin().await?;
+        // Match fenced reports and retries: lock the actual parent before
+        // the activity, including the legacy settlement repair path.
+        sqlx::query(
+            "SELECT id FROM workflow.workflows WHERE id =
+            (SELECT workflow_id FROM workflow.activities WHERE id = $1) FOR UPDATE",
+        )
+        .bind(settlement.activity_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let current: Option<(String,)> =
             sqlx::query_as("SELECT status FROM workflow.activities WHERE id = $1 FOR UPDATE")
                 .bind(settlement.activity_id)

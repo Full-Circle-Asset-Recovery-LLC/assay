@@ -179,6 +179,11 @@ pub trait WorkflowStore: Send + Sync + 'static {
         workflow_id: &str,
     ) -> impl Future<Output = anyhow::Result<i64>> + Send;
 
+    /// Whether activity claims enforce their due time and live workflow guard.
+    fn supports_activity_due_time_claims(&self) -> bool {
+        false
+    }
+
     // ── Activities ──────────────────────────────────────────
 
     fn create_activity(
