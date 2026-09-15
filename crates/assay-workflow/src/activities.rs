@@ -265,6 +265,58 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
         Ok(())
     }
 
+    /// Complete only the attempt returned by a prior claim. A false result
+    /// means ownership or workflow liveness changed; no report was applied.
+    pub async fn complete_activity_fenced(
+        &self,
+        id: i64,
+        result: Option<&str>,
+        fence: ActivityFence<'_>,
+    ) -> Result<bool> {
+        self.report_activity_fenced(id, fence, ActivityReport::Complete { result })
+            .await
+    }
+
+    pub async fn fail_activity_fenced(
+        &self,
+        id: i64,
+        error: &str,
+        fence: ActivityFence<'_>,
+    ) -> Result<bool> {
+        self.report_activity_fenced(id, fence, ActivityReport::Fail { error })
+            .await
+    }
+
+    pub async fn heartbeat_activity_fenced(
+        &self,
+        id: i64,
+        details: Option<&str>,
+        fence: ActivityFence<'_>,
+    ) -> Result<bool> {
+        self.report_activity_fenced(id, fence, ActivityReport::Heartbeat { details })
+            .await
+    }
+
+    async fn report_activity_fenced(
+        &self,
+        id: i64,
+        fence: ActivityFence<'_>,
+        report: ActivityReport<'_>,
+    ) -> Result<bool> {
+        let applied = self
+            .store
+            .report_activity(id, fence, report, timestamp_now())
+            .await?;
+        if applied
+            && !matches!(report, ActivityReport::Heartbeat { .. })
+            && let Some(act) = self.store.get_activity(id).await?
+            && matches!(act.status.as_str(), "COMPLETED" | "FAILED")
+        {
+            self.emit_needs_dispatch(&act.workflow_id).await;
+        }
+        Ok(applied)
+    }
+
     pub async fn heartbeat_activity(&self, id: i64, details: Option<&str>) -> Result<()> {
         self.store.heartbeat_activity(id, details).await
     }

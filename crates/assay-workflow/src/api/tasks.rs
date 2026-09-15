@@ -9,7 +9,7 @@ use utoipa::ToSchema;
 use crate::api::workflows::AppError;
 use crate::ctx::WorkflowCtx;
 use crate::store::WorkflowStore;
-use crate::types::WorkflowWorker;
+use crate::types::{ActivityFence, WorkflowWorker};
 
 pub fn router<S: WorkflowStore + 'static>() -> Router<Arc<WorkflowCtx<S>>> {
     Router::new()
@@ -145,6 +145,10 @@ pub async fn poll_task<S: WorkflowStore>(
 
 #[derive(Deserialize, ToSchema)]
 pub struct CompleteTaskBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    pub expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    pub claimed_by: Option<String>,
     /// JSON result from the completed activity
     pub result: Option<serde_json::Value>,
 }
@@ -154,7 +158,7 @@ pub struct CompleteTaskBody {
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
     request_body = CompleteTaskBody,
-    responses((status = 200, description = "Task completed")),
+    responses((status = 200, description = "Task completed"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn complete_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
@@ -162,6 +166,13 @@ pub async fn complete_task<S: WorkflowStore>(
     Json(body): Json<CompleteTaskBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
     let result = body.result.map(|v| v.to_string());
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state
+                .complete_activity_fenced(id, result.as_deref(), fence)
+                .await?,
+        ));
+    }
     state
         .complete_activity(id, result.as_deref(), None, false)
         .await?;
@@ -170,6 +181,10 @@ pub async fn complete_task<S: WorkflowStore>(
 
 #[derive(Deserialize, ToSchema)]
 pub struct FailTaskBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    pub expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    pub claimed_by: Option<String>,
     /// Error message describing why the task failed
     pub error: String,
 }
@@ -179,7 +194,7 @@ pub struct FailTaskBody {
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
     request_body = FailTaskBody,
-    responses((status = 200, description = "Task marked as failed")),
+    responses((status = 200, description = "Task marked as failed"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn fail_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
@@ -189,12 +204,21 @@ pub async fn fail_task<S: WorkflowStore>(
     // fail_activity honors the activity's retry policy: re-queues with
     // backoff while attempts remain, otherwise marks FAILED + appends
     // ActivityFailed event.
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state.fail_activity_fenced(id, &body.error, fence).await?,
+        ));
+    }
     state.fail_activity(id, &body.error).await?;
     Ok(axum::http::StatusCode::OK)
 }
 
 #[derive(Deserialize, ToSchema)]
 pub struct HeartbeatTaskBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    pub expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    pub claimed_by: Option<String>,
     pub details: Option<String>,
 }
 
@@ -202,17 +226,49 @@ pub struct HeartbeatTaskBody {
     post, path = "/api/v1/engine/workflow/tasks/{id}/heartbeat",
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
-    responses((status = 200, description = "Heartbeat recorded")),
+    request_body = HeartbeatTaskBody,
+    responses((status = 200, description = "Heartbeat recorded"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn heartbeat_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
     Path(id): Path<i64>,
     Json(body): Json<HeartbeatTaskBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state
+                .heartbeat_activity_fenced(id, body.details.as_deref(), fence)
+                .await?,
+        ));
+    }
     state
         .heartbeat_activity(id, body.details.as_deref())
         .await?;
     Ok(axum::http::StatusCode::OK)
+}
+
+fn report_fence(
+    expected_attempt: Option<i32>,
+    claimed_by: Option<&str>,
+) -> Result<Option<ActivityFence<'_>>, AppError> {
+    match expected_attempt {
+        Some(attempt) if attempt > 0 => Ok(Some(ActivityFence {
+            expected_attempt: attempt,
+            claimed_by,
+        })),
+        None if claimed_by.is_none() => Ok(None),
+        _ => Err(AppError::bad_request(
+            "expected_attempt must be positive and is required with claimed_by".into(),
+        )),
+    }
+}
+
+fn report_status(applied: bool) -> axum::http::StatusCode {
+    if applied {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::CONFLICT
+    }
 }
 
 fn timestamp_now() -> f64 {

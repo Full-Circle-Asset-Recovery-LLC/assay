@@ -660,3 +660,54 @@ assay workflow wait deploy-1234 --timeout 300   # exit 0 on COMPLETED, 1 on fail
 - Default `assay-engine` builds include S3 archival as of v0.5.6, but it is a runtime no-op unless
   `ASSAY_ARCHIVE_S3_BUCKET` is set. Custom `assay-workflow` embedders opt in with the default-off
   `s3-archival` cargo feature.
+
+### Attempt-fenced activity reports
+
+Workers that need stale-attempt protection must check
+`GET /api/v1/engine/workflow/health` before accepting work. Require both
+`capabilities.activity_attempt_fencing` and
+`capabilities.activity_due_time_claims` to be JSON `true`. Missing fields or
+`false` mean the store does not advertise this contract. The health route remains
+public. Version strings alone do not establish support.
+
+The existing activity report routes accept two optional top-level fields:
+
+| Field | Meaning |
+|---|---|
+| `expected_attempt` | Positive integer copied from the claimed task's `attempt` |
+| `claimed_by` | Optional worker ID copied from the claimed task's `claimed_by`; requires `expected_attempt` |
+
+For example, send a retryable failure to
+`POST /api/v1/engine/workflow/tasks/123/fail`:
+
+```json
+{"error":"dependency unavailable","expected_attempt":2,"claimed_by":"worker-1"}
+```
+
+Use the same fence fields with `/tasks/{id}/complete` (`result`) and
+`/tasks/{id}/heartbeat` (`details`). A fenced report returns HTTP 200 only when
+applied. HTTP 409 means the activity is missing, no longer RUNNING, belongs to a
+different attempt or owner, or its workflow is terminal or has requested
+cancellation. Rejection writes no activity row, history event, or dispatch marker.
+An invalid fence returns HTTP 400. Omitting both fields retains the legacy API.
+
+The built-in SQLite and PostgreSQL stores check the fence and workflow state in
+the transaction that applies the report. Completion stores its result, history
+event, and dispatch marker together. Failure advances a running attempt once and
+sets the retry deadline. Claims exclude future deadlines, terminal workflows, and
+workflows with a `WorkflowCancelRequested` event. Heartbeats use the same fence;
+workers can use them to check the current lease before starting work. A successful
+heartbeat is not a lock on later external effects. Check ownership again before
+publishing an external result.
+
+Rust embedders can use `complete_activity_fenced`, `fail_activity_fenced`, and
+`heartbeat_activity_fenced` on `WorkflowCtx`. Stores implement the additive
+`WorkflowStore::report_activity` operation with `ActivityFence` and
+`ActivityReport`. Custom stores default to unsupported capabilities and rejected
+fenced reports. Legacy settlement and its repair API remain available.
+
+The fence compares the current attempt and, when supplied, its owner. It is not a
+lease generation across an operator retry that resets `attempt` to 1. A worker
+that needs protection across those resets must use a separate application-level
+generation or reject reset deliveries. This change preserves the existing
+operator retry budget and reset behavior.
