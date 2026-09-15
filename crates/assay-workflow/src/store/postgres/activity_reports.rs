@@ -1,5 +1,175 @@
-//! Due-time claims and legacy retry compare-and-swap.
+//! Atomic attempt reports. Parent lock always precedes the activity lock.
 use super::*;
+use crate::store::activity_reports::{ReportWrite, plan_report};
+
+impl PostgresStore {
+    pub(super) async fn apply_activity_report(
+        &self,
+        id: i64,
+        fence: ActivityFence<'_>,
+        report: ActivityReport<'_>,
+        now: f64,
+    ) -> Result<bool> {
+        if fence.expected_attempt <= 0 {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        // Lock even a cancelling parent first. The following statement gets
+        // a fresh PostgreSQL snapshot after any cancellation writer commits.
+        let parent: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM workflow.workflows WHERE id =
+             (SELECT workflow_id FROM workflow.activities WHERE id = $1) FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workflow_id,)) = parent else {
+            return Ok(false);
+        };
+        let live: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM workflow.workflows w WHERE id = $1
+             AND status IN ('PENDING', 'RUNNING', 'WAITING') AND archived_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = w.id
+                 AND e.event_type = 'WorkflowCancelRequested')",
+        )
+        .bind(&workflow_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Ok(false);
+        }
+        let current = sqlx::query_as::<_, PgActivityRow>(
+            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat FROM workflow.activities WHERE id = $1 FOR UPDATE"
+        ).bind(id).fetch_optional(&mut *tx).await?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let act: WorkflowActivity = current.into();
+        if act.status != "RUNNING"
+            || act.attempt != fence.expected_attempt
+            || fence
+                .claimed_by
+                .is_some_and(|owner| act.claimed_by.as_deref() != Some(owner))
+        {
+            return Ok(false);
+        }
+        let Some(write) = plan_report(&act, report, now) else {
+            return Ok(false);
+        };
+        Self::write_activity_report(&mut tx, &act, write, now).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn write_activity_report(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        act: &WorkflowActivity,
+        write: ReportWrite<'_>,
+        now: f64,
+    ) -> Result<()> {
+        match write {
+            ReportWrite::Heartbeat => {
+                sqlx::query("UPDATE workflow.activities SET last_heartbeat = CASE WHEN last_heartbeat IS NULL OR last_heartbeat < $1 THEN $2 ELSE last_heartbeat END WHERE id = $3")
+                    .bind(now)
+                    .bind(now)
+                    .bind(act.id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            ReportWrite::Retry {
+                attempt,
+                scheduled_at,
+            } => {
+                sqlx::query(
+                    "UPDATE workflow.activities SET status = 'PENDING', attempt = $1,
+                    scheduled_at = $2, claimed_by = NULL, started_at = NULL,
+                    last_heartbeat = NULL, completed_at = NULL, error = NULL WHERE id = $3",
+                )
+                .bind(attempt)
+                .bind(scheduled_at)
+                .bind(act.id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            ReportWrite::Settle {
+                result,
+                error,
+                payload,
+                failed,
+                timeout,
+            } => {
+                sqlx::query(
+                    "UPDATE workflow.activities SET status = $1, result = $2, error = $3,
+                    completed_at = $4 WHERE id = $5",
+                )
+                .bind(if failed { "FAILED" } else { "COMPLETED" })
+                .bind(result)
+                .bind(error)
+                .bind(now)
+                .bind(act.id)
+                .execute(&mut **tx)
+                .await?;
+                Self::append_report_event(tx, act, &payload, failed, now).await?;
+                if timeout {
+                    sqlx::query(
+                        "UPDATE workflow.workflows SET status = 'FAILED', error = $1,
+                        updated_at = $2, completed_at = $3, needs_dispatch = TRUE WHERE id = $4",
+                    )
+                    .bind(format!(
+                        "Activity '{}' timed out after {} attempts",
+                        act.name, act.max_attempts
+                    ))
+                    .bind(now)
+                    .bind(now)
+                    .bind(&act.workflow_id)
+                    .execute(&mut **tx)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE workflow.workflows SET needs_dispatch = TRUE WHERE id = $1",
+                    )
+                    .bind(&act.workflow_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn append_report_event(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        act: &WorkflowActivity,
+        payload: &str,
+        failed: bool,
+        now: f64,
+    ) -> Result<()> {
+        let seq: (i32,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM workflow.events WHERE workflow_id = $1",
+        )
+        .bind(&act.workflow_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workflow.events
+            (workflow_id, seq, event_type, payload, activity_id, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&act.workflow_id)
+        .bind(seq.0)
+        .bind(if failed {
+            "ActivityFailed"
+        } else {
+            "ActivityCompleted"
+        })
+        .bind(payload)
+        .bind(act.id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
 
 impl PostgresStore {
     pub(super) async fn claim_due_activity(
