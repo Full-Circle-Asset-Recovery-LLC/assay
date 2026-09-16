@@ -13,9 +13,12 @@ impl PostgresStore {
         if fence.expected_attempt <= 0 {
             return Ok(false);
         }
-        let mut tx = self.pool.begin().await?;
-        // Lock even a cancelling parent first. The following statement gets
-        // a fresh PostgreSQL snapshot after any cancellation writer commits.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        // Pin only this transaction: the post-lock cancellation read requires
+        // a fresh statement snapshot even when the caller pool defaults differ.
         let parent: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM workflow.workflows WHERE id =
              (SELECT workflow_id FROM workflow.activities WHERE id = $1) FOR UPDATE",
