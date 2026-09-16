@@ -163,7 +163,10 @@ macro_rules! backend_contract {
     ($name:ident, $contract:ident) => {
         #[rstest]
         #[cfg_attr(feature = "backend-sqlite", case::sqlite(Backend::Sqlite))]
-        #[cfg_attr(feature = "backend-postgres", case::postgres(Backend::Postgres))]
+        #[cfg_attr(
+            all(feature = "backend-postgres", target_os = "linux"),
+            case::postgres(Backend::Postgres)
+        )]
         #[tokio::test]
         async fn $name(#[case] backend: Backend) {
             let harness = backend.setup().await.unwrap();
@@ -230,7 +233,7 @@ backend_contract!(
     cancelled_parent_retry_contract
 );
 
-#[cfg(feature = "backend-postgres")]
+#[cfg(all(feature = "backend-postgres", target_os = "linux"))]
 async fn wait_for_blocked_query(pool: &sqlx::PgPool) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -252,7 +255,7 @@ async fn wait_for_blocked_query(pool: &sqlx::PgPool) {
     .expect("legacy settlement must reach its blocked parent lock");
 }
 
-#[cfg(feature = "backend-postgres")]
+#[cfg(all(feature = "backend-postgres", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_legacy_settlement_locks_parent_before_activity() {
     use assay_workflow::PostgresStore;
