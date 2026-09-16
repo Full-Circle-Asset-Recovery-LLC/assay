@@ -307,7 +307,10 @@ macro_rules! backend_contract {
     ($name:ident, $contract:ident) => {
         #[rstest]
         #[cfg_attr(feature = "backend-sqlite", case::sqlite(Backend::Sqlite))]
-        #[cfg_attr(feature = "backend-postgres", case::postgres(Backend::Postgres))]
+        #[cfg_attr(
+            all(feature = "backend-postgres", target_os = "linux"),
+            case::postgres(Backend::Postgres)
+        )]
         #[tokio::test]
         async fn $name(#[case] backend: Backend) {
             let harness = backend.setup().await.unwrap();
