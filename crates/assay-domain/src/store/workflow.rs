@@ -179,9 +179,28 @@ pub trait WorkflowStore: Send + Sync + 'static {
         workflow_id: &str,
     ) -> impl Future<Output = anyhow::Result<i64>> + Send;
 
+    /// Explicit capability opt-in. External stores default to fail closed.
+    fn supports_activity_fencing(&self) -> bool {
+        false
+    }
+
     /// Whether activity claims enforce their due time and live workflow guard.
     fn supports_activity_due_time_claims(&self) -> bool {
         false
+    }
+
+    /// Apply a report only to the matching running attempt of a live workflow.
+    /// Rejected reports write no row, history event, or dispatch marker.
+    /// Implementations must check ownership and cancellation transactionally.
+    fn report_activity(
+        &self,
+        id: i64,
+        fence: ActivityFence<'_>,
+        report: ActivityReport<'_>,
+        now: f64,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send {
+        let _ = (id, fence, report, now);
+        async { Ok(false) }
     }
 
     // ── Activities ──────────────────────────────────────────

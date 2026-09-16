@@ -404,3 +404,27 @@ pub enum SettleOutcome {
     /// No activity with this id.
     Unknown,
 }
+
+/// Ownership observed when an activity was claimed. Reports are accepted only
+/// while this attempt is RUNNING and its workflow has not requested cancellation.
+#[derive(Clone, Copy, Debug)]
+pub struct ActivityFence<'a> {
+    pub expected_attempt: i32,
+    pub claimed_by: Option<&'a str>,
+}
+
+/// An opt-in, transactionally fenced activity report.
+#[derive(Clone, Copy, Debug)]
+pub enum ActivityReport<'a> {
+    Complete {
+        result: Option<&'a str>,
+    },
+    Fail {
+        error: &'a str,
+    },
+    Heartbeat {
+        details: Option<&'a str>,
+    },
+    /// Rechecks the current timeout inside the transaction before applying it.
+    Timeout,
+}

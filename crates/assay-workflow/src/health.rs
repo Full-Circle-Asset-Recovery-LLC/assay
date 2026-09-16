@@ -49,6 +49,21 @@ pub async fn check_health_at<S: WorkflowStore>(store: &S, now: f64) -> Result<()
     for act in &timed_out {
         let act_id = act.id.unwrap_or(-1);
 
+        if store.supports_activity_fencing() {
+            store
+                .report_activity(
+                    act_id,
+                    crate::types::ActivityFence {
+                        expected_attempt: act.attempt,
+                        claimed_by: act.claimed_by.as_deref(),
+                    },
+                    crate::types::ActivityReport::Timeout,
+                    now,
+                )
+                .await?;
+            continue;
+        }
+
         if act.attempt < act.max_attempts {
             // Retry: re-queue with the same exponential backoff fail_activity
             // uses. (Terminally completing here used to wedge the run: the

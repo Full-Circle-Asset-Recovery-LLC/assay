@@ -4,6 +4,7 @@
 //! `crate::store::WorkflowStore` and `crate::store::<DTO>` paths resolve
 //! unchanged.
 
+mod activity_reports;
 pub mod postgres;
 pub(crate) mod relocation;
 pub mod sqlite;

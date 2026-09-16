@@ -480,8 +480,21 @@ impl SqliteStore {
 }
 
 impl WorkflowStore for SqliteStore {
+    fn supports_activity_fencing(&self) -> bool {
+        true
+    }
     fn supports_activity_due_time_claims(&self) -> bool {
         true
+    }
+
+    async fn report_activity(
+        &self,
+        id: i64,
+        fence: ActivityFence<'_>,
+        report: ActivityReport<'_>,
+        now: f64,
+    ) -> Result<bool> {
+        self.apply_activity_report(id, fence, report, now).await
     }
 
     // ── Namespaces ─────────────────────────────────────────
