@@ -1,10 +1,10 @@
-//! SQLite's additive report store contract, before HTTP opt-in exposure.
-#![cfg(feature = "backend-sqlite")]
-
+//! Both native stores implement the additive report contract before HTTP exposure.
 mod common;
 
+#[cfg(feature = "backend-sqlite")]
+use assay_workflow::SqliteStore;
+use assay_workflow::WorkflowStore;
 use assay_workflow::types::*;
-use assay_workflow::{SqliteStore, WorkflowStore};
 use common::{Backend, Harness, make_workflow};
 use rstest::rstest;
 
@@ -307,6 +307,10 @@ macro_rules! backend_contract {
     ($name:ident, $contract:ident) => {
         #[rstest]
         #[cfg_attr(feature = "backend-sqlite", case::sqlite(Backend::Sqlite))]
+        #[cfg_attr(
+            all(feature = "backend-postgres", target_os = "linux"),
+            case::postgres(Backend::Postgres)
+        )]
         #[tokio::test]
         async fn $name(#[case] backend: Backend) {
             let harness = backend.setup().await.unwrap();
@@ -334,6 +338,7 @@ backend_contract!(
     terminal_parent_reports_contract
 );
 
+#[cfg(feature = "backend-sqlite")]
 #[tokio::test]
 async fn fenced_event_failure_rolls_back_every_write() {
     let store = SqliteStore::new("sqlite::memory:").await.unwrap();
