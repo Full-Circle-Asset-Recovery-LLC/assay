@@ -27,7 +27,7 @@ use crate::store::WorkflowStore;
 
 pub fn router<S: WorkflowStore + 'static>() -> Router<Arc<WorkflowCtx<S>>> {
     Router::new()
-        .route("/health", get(health_check))
+        .route("/health", get(health_with_capabilities::<S>))
         .route("/version", get(version))
 }
 
@@ -41,6 +41,17 @@ pub async fn health_check() -> Json<serde_json::Value> {
         "status": "ok",
         "service": "assay-workflow",
     }))
+}
+
+async fn health_with_capabilities<S: WorkflowStore>(
+    State(state): State<Arc<WorkflowCtx<S>>>,
+) -> Json<serde_json::Value> {
+    let Json(mut health) = health_check().await;
+    health["capabilities"] = serde_json::json!({
+        "activity_attempt_fencing": state.store.supports_activity_fencing(),
+        "activity_due_time_claims": state.store.supports_activity_due_time_claims(),
+    });
+    Json(health)
 }
 
 #[derive(Serialize, ToSchema)]

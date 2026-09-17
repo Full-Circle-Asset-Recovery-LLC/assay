@@ -9,16 +9,16 @@ use utoipa::ToSchema;
 use crate::api::workflows::AppError;
 use crate::ctx::WorkflowCtx;
 use crate::store::WorkflowStore;
-use crate::types::WorkflowWorker;
+use crate::types::{ActivityFence, WorkflowWorker};
 
 pub fn router<S: WorkflowStore + 'static>() -> Router<Arc<WorkflowCtx<S>>> {
     Router::new()
         .route("/workers/register", post(register_worker))
         .route("/workers/heartbeat", post(worker_heartbeat))
         .route("/tasks/poll", post(poll_task))
-        .route("/tasks/{id}/complete", post(complete_task))
-        .route("/tasks/{id}/fail", post(fail_task))
-        .route("/tasks/{id}/heartbeat", post(heartbeat_task))
+        .route("/tasks/{id}/complete", post(complete_task_report))
+        .route("/tasks/{id}/fail", post(fail_task_report))
+        .route("/tasks/{id}/heartbeat", post(heartbeat_task_report))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -149,19 +149,53 @@ pub struct CompleteTaskBody {
     pub result: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub(super) struct CompleteTaskReportBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    claimed_by: Option<String>,
+    /// JSON result from the completed activity
+    result: Option<serde_json::Value>,
+}
+
 #[utoipa::path(
     post, path = "/api/v1/engine/workflow/tasks/{id}/complete",
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
-    request_body = CompleteTaskBody,
-    responses((status = 200, description = "Task completed")),
+    request_body = CompleteTaskReportBody,
+    responses((status = 200, description = "Task completed"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn complete_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
     Path(id): Path<i64>,
     Json(body): Json<CompleteTaskBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    complete_task_report(
+        State(state),
+        Path(id),
+        Json(CompleteTaskReportBody {
+            expected_attempt: None,
+            claimed_by: None,
+            result: body.result,
+        }),
+    )
+    .await
+}
+
+async fn complete_task_report<S: WorkflowStore>(
+    State(state): State<Arc<WorkflowCtx<S>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<CompleteTaskReportBody>,
+) -> Result<axum::http::StatusCode, AppError> {
     let result = body.result.map(|v| v.to_string());
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state
+                .complete_activity_fenced(id, result.as_deref(), fence)
+                .await?,
+        ));
+    }
     state
         .complete_activity(id, result.as_deref(), None, false)
         .await?;
@@ -174,21 +208,53 @@ pub struct FailTaskBody {
     pub error: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub(super) struct FailTaskReportBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    claimed_by: Option<String>,
+    /// Error message describing why the task failed
+    error: String,
+}
+
 #[utoipa::path(
     post, path = "/api/v1/engine/workflow/tasks/{id}/fail",
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
-    request_body = FailTaskBody,
-    responses((status = 200, description = "Task marked as failed")),
+    request_body = FailTaskReportBody,
+    responses((status = 200, description = "Task marked as failed"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn fail_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
     Path(id): Path<i64>,
     Json(body): Json<FailTaskBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    fail_task_report(
+        State(state),
+        Path(id),
+        Json(FailTaskReportBody {
+            expected_attempt: None,
+            claimed_by: None,
+            error: body.error,
+        }),
+    )
+    .await
+}
+
+async fn fail_task_report<S: WorkflowStore>(
+    State(state): State<Arc<WorkflowCtx<S>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<FailTaskReportBody>,
+) -> Result<axum::http::StatusCode, AppError> {
     // fail_activity honors the activity's retry policy: re-queues with
     // backoff while attempts remain, otherwise marks FAILED + appends
     // ActivityFailed event.
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state.fail_activity_fenced(id, &body.error, fence).await?,
+        ));
+    }
     state.fail_activity(id, &body.error).await?;
     Ok(axum::http::StatusCode::OK)
 }
@@ -198,21 +264,79 @@ pub struct HeartbeatTaskBody {
     pub details: Option<String>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub(super) struct HeartbeatTaskReportBody {
+    /// Optional positive claim attempt. Opts into transactional ownership fencing.
+    expected_attempt: Option<i32>,
+    /// Optional claim owner; requires expected_attempt when supplied.
+    claimed_by: Option<String>,
+    details: Option<String>,
+}
+
 #[utoipa::path(
     post, path = "/api/v1/engine/workflow/tasks/{id}/heartbeat",
     tag = "tasks",
     params(("id" = i64, Path, description = "Activity task ID")),
-    responses((status = 200, description = "Heartbeat recorded")),
+    request_body = HeartbeatTaskReportBody,
+    responses((status = 200, description = "Heartbeat recorded"), (status = 409, description = "Stale or cancelled claim"), (status = 400, description = "Invalid fence")),
 )]
 pub async fn heartbeat_task<S: WorkflowStore>(
     State(state): State<Arc<WorkflowCtx<S>>>,
     Path(id): Path<i64>,
     Json(body): Json<HeartbeatTaskBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
+    heartbeat_task_report(
+        State(state),
+        Path(id),
+        Json(HeartbeatTaskReportBody {
+            expected_attempt: None,
+            claimed_by: None,
+            details: body.details,
+        }),
+    )
+    .await
+}
+
+async fn heartbeat_task_report<S: WorkflowStore>(
+    State(state): State<Arc<WorkflowCtx<S>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<HeartbeatTaskReportBody>,
+) -> Result<axum::http::StatusCode, AppError> {
+    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+        return Ok(report_status(
+            state
+                .heartbeat_activity_fenced(id, body.details.as_deref(), fence)
+                .await?,
+        ));
+    }
     state
         .heartbeat_activity(id, body.details.as_deref())
         .await?;
     Ok(axum::http::StatusCode::OK)
+}
+
+fn report_fence(
+    expected_attempt: Option<i32>,
+    claimed_by: Option<&str>,
+) -> Result<Option<ActivityFence<'_>>, AppError> {
+    match expected_attempt {
+        Some(attempt) if attempt > 0 => Ok(Some(ActivityFence {
+            expected_attempt: attempt,
+            claimed_by,
+        })),
+        None if claimed_by.is_none() => Ok(None),
+        _ => Err(AppError::bad_request(
+            "expected_attempt must be positive and is required with claimed_by".into(),
+        )),
+    }
+}
+
+fn report_status(applied: bool) -> axum::http::StatusCode {
+    if applied {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::CONFLICT
+    }
 }
 
 fn timestamp_now() -> f64 {
