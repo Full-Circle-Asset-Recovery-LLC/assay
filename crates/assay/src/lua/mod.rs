@@ -57,16 +57,26 @@ pub fn memory_limit_mb(value: Option<&str>) -> Result<usize> {
     Ok(mb)
 }
 
-/// Memory ceiling in bytes from the process environment.
+/// Memory ceiling in bytes from the process environment, read once per process
+/// so every VM gets the same limit even if a script later calls `env.set`.
 pub fn memory_limit_bytes_from_env() -> Result<usize> {
-    let value = match std::env::var(MEMORY_MB_ENV) {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("{MEMORY_MB_ENV} is not valid UTF-8")
-        }
-    };
-    Ok(memory_limit_mb(value.as_deref())? * 1024 * 1024)
+    static LIMIT: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    LIMIT
+        .get_or_init(|| {
+            let value = match std::env::var(MEMORY_MB_ENV) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(format!("{MEMORY_MB_ENV} is not valid UTF-8"));
+                }
+            };
+            let mb = memory_limit_mb(value.as_deref()).map_err(|e| e.to_string())?;
+            mb.checked_mul(1024 * 1024)
+                .ok_or_else(|| format!("{MEMORY_MB_ENV} overflows this platform: {mb} MiB"))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 pub fn readonly_from_env() -> bool {

@@ -95,10 +95,13 @@ fn ceiling_is_enforced_at_the_configured_limit() {
         local ok, err = pcall(function()
           for i = 1, 96 do held[i] = string.rep(string.format("%08d", i), 131072) end
         end)
+        held = nil
+        collectgarbage()
         print(ok and "fit" or ("oom:" .. tostring(err)))
     "#,
     );
     let small = run(&f, None);
+    assert!(small.status.success(), "the OOM is caught in-script");
     assert!(
         String::from_utf8_lossy(&small.stdout).contains("oom:"),
         "64 MiB must refuse 96 MiB"
