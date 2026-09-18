@@ -1,0 +1,78 @@
+name: Lua runtime backport
+
+on:
+  pull_request:
+    branches: [maintenance/lua-0.19.1]
+  push:
+    branches: [maintenance/lua-0.19.1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lua-backport-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Lua runtime backport verification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify deployed baseline ancestry (assay-lua-v0.19.1)
+        run: git merge-base --is-ancestor 06be1ba5b84ca8c814baa7d2062616b6093e63d7 HEAD
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: lua-backport
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check Lua runtime warnings
+        run: cargo clippy --locked -p assay-lua --all-targets -- -D warnings
+      - name: Verify the configurable VM memory limit
+        run: cargo test --locked -p assay-lua --test lua_memory_limit
+      - name: Verify Lua runtime contracts
+        run: cargo test --locked -p assay-lua
+
+  package:
+    name: Verified Lua runtime artifact
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify deployed baseline ancestry (assay-lua-v0.19.1)
+        run: git merge-base --is-ancestor 06be1ba5b84ca8c814baa7d2062616b6093e63d7 HEAD
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: lua-backport-release
+      - name: Build assay from exact accepted source
+        run: cargo build --locked --release -p assay-lua --bin assay
+      - name: Package immutable Lua runtime artifact
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_LUA_VERSION: 0.19.1+memory.1
+        run: python3 .github/release/package-lua-backport.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lua-backport-${{ github.sha }}
+          path: dist/lua-backport/
+          if-no-files-found: error
+          retention-days: 30

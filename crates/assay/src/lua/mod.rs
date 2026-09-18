@@ -28,6 +28,47 @@ pub const BLOCK_GLOBALS_ENV: &str = "ASSAY_BLOCK_GLOBALS";
 /// `--readonly` CLI flag activates the same mode per invocation.
 pub const READONLY_ENV: &str = "ASSAY_READONLY";
 
+/// Lua VM memory ceiling in MiB for every VM the process creates. Unset keeps
+/// the historical 64 MiB. A set value must be a whole number of MiB in
+/// `MIN_MEMORY_MB..=MAX_MEMORY_MB`; anything else refuses VM creation rather
+/// than running with a limit the operator did not ask for.
+pub const MEMORY_MB_ENV: &str = "ASSAY_LUA_MEMORY_MB";
+pub const DEFAULT_MEMORY_MB: usize = 64;
+pub const MIN_MEMORY_MB: usize = 16;
+pub const MAX_MEMORY_MB: usize = 4096;
+
+/// Parses an `ASSAY_LUA_MEMORY_MB` value (`None` = unset) into MiB.
+pub fn memory_limit_mb(value: Option<&str>) -> Result<usize> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_MEMORY_MB);
+    };
+    let digits = raw.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("{MEMORY_MB_ENV} must be a whole number of MiB, got {raw:?}");
+    }
+    let mb: usize = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{MEMORY_MB_ENV} is out of range: {raw:?}"))?;
+    if !(MIN_MEMORY_MB..=MAX_MEMORY_MB).contains(&mb) {
+        anyhow::bail!(
+            "{MEMORY_MB_ENV} must be between {MIN_MEMORY_MB} and {MAX_MEMORY_MB} MiB, got {mb}"
+        );
+    }
+    Ok(mb)
+}
+
+/// Memory ceiling in bytes from the process environment.
+pub fn memory_limit_bytes_from_env() -> Result<usize> {
+    let value = match std::env::var(MEMORY_MB_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{MEMORY_MB_ENV} is not valid UTF-8")
+        }
+    };
+    Ok(memory_limit_mb(value.as_deref())? * 1024 * 1024)
+}
+
 pub fn readonly_from_env() -> bool {
     matches!(
         std::env::var(READONLY_ENV).ok().as_deref().map(str::trim),
@@ -235,7 +276,15 @@ pub fn create_vm_with_policy(
     } = options;
     let libs = StdLib::ALL_SAFE;
     let lua = Lua::new_with(libs, LuaOptions::default()).map_err(lua_err)?;
-    lua.set_memory_limit(64 * 1024 * 1024).map_err(lua_err)?;
+    let memory_limit = memory_limit_bytes_from_env()?;
+    lua.set_memory_limit(memory_limit).map_err(lua_err)?;
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!(
+            limit_mib = memory_limit / (1024 * 1024),
+            "lua vm memory limit"
+        );
+    });
     // Installed before the builtins register so `env` and the module
     // searchers can consult it on their very first call.
     let policed = resolve_policy(policy)?;
@@ -246,6 +295,7 @@ pub fn create_vm_with_policy(
     register_fs_loader(&lua, global_modules_path).map_err(lua_err)?;
     register_stdlib_loader(&lua).map_err(lua_err)?;
     builtins::register_all(&lua, client).map_err(lua_err)?;
+    register_memory(&lua, memory_limit).map_err(lua_err)?;
     // Before the mode gates, so a gate wrapping an http builtin wraps the
     // policy-guarded version and both checks run.
     if let Some(policy) = policed.as_ref() {
@@ -258,6 +308,17 @@ pub fn create_vm_with_policy(
         ExecMode::Unrestricted => {}
     }
     Ok(lua)
+}
+
+/// `assay_memory()` -> `{ limit_bytes, used_bytes }` for this VM.
+fn register_memory(lua: &Lua, limit: usize) -> mlua::Result<()> {
+    let report = lua.create_function(move |lua, ()| {
+        let out = lua.create_table()?;
+        out.set("limit_bytes", limit)?;
+        out.set("used_bytes", lua.used_memory())?;
+        Ok(out)
+    })?;
+    lua.globals().set("assay_memory", report)
 }
 
 fn sandbox(lua: &Lua) -> mlua::Result<()> {
