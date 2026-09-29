@@ -36,6 +36,25 @@ libs/<name>/VERSION     ──bump──►   release-libs.yml        ──► 
 
 The release-existence check is by tag — re-running the workflow on the same version is a no-op.
 
+## Releasing a maintenance engine
+
+Maintenance engine builds use the `maintenance/engine-0.5.15` branch and independent build
+metadata. They do not publish the Lua binary or library crates.
+
+1. Choose a new, unused `assay-engine` version such as `0.5.15+schedule.2`. Update its manifest,
+   lockfile, changelog, workflow module notes, and the backport workflow's `EXPECTED_ENGINE_VERSION`.
+2. Review the maintenance PR and wait for every check, including PostgreSQL 16 and 18. Merge
+   only after those checks succeed.
+3. Wait for the post-merge `Engine backport` workflow. Its package job produces
+   `engine-backport-<merge-sha>` only after verification. Download the artifact from that exact run.
+4. Check `manifest.json` against the merged source SHA, repository, workflow run and attempt,
+   binary version, lockfile hash and glibc ceiling. Verify `checksums.txt` and the binary's version.
+5. Create the new release tag at that merge SHA and upload `assay-engine-linux-x86_64`,
+   `manifest.json`, and `checksums.txt` from the verified artifact. Never replace an existing
+   version's assets or reuse a tag for different bytes.
+6. Read back the release assets and checksums before a consumer updates its version/checksum
+   pin. Keep the previous immutable release for rollback.
+
 ## Releasing a library
 
 1. Bump `libs/<name>/VERSION`.

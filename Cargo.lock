@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "assay-engine"
-version = "0.5.15+schedule.1"
+version = "0.5.15+schedule.2"
 dependencies = [
  "anyhow",
  "assay-auth",
