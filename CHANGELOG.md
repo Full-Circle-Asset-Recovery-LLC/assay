@@ -1,5 +1,13 @@
 # Changelog
 
+## Engine 0.5.15+schedule.2 / workflow 0.4.5 — 2026-09-29
+
+- Claim initial and retry activities only when due and their parent is running, not archived, and has no committed cancellation request.
+- Reject stale or duplicate retry updates so they cannot shorten the next attempt's deadline.
+- Preserve PostgreSQL parent-before-activity locking and SQLite transaction boundaries, with 15 maintenance regressions and the unchanged scheduler tests.
+- This source-only maintenance build preserves schemas and public APIs. It does not make the legacy multi-write cancellation sequence fully transactional.
+- Publish distinct immutable binary, checksum, and source-provenance assets; the prior maintenance release remains available for rollback.
+
 ## Engine 0.5.15+schedule.1 / workflow 0.4.5 — 2026-09-12
 
 - Keep PostgreSQL scheduler leadership on a dedicated connection shared by store clones, so data-pool churn does not skip due schedule checks.

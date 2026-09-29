@@ -663,10 +663,22 @@ assay workflow wait deploy-1234 --timeout 300   # exit 0 on COMPLETED, 1 on fail
 
 ### PostgreSQL scheduler connection ownership
 
-The 0.5.15+schedule.1 maintenance engine keeps scheduler advisory lock 42 on a
+The 0.5.15+schedule.2 maintenance engine retains scheduler advisory lock 42 on a
 dedicated PostgreSQL connection shared by clones of one store. Data-pool traffic
 cannot move its leadership check to another session. Connection establishment and
 ownership queries have bounded waits; failed sessions are discarded before a
 later tick may compete for leadership again. Dropping the final store clone closes
 the dedicated connection. This fixes pool-induced missed ticks; it does not provide
 transactional fencing across an entire schedule evaluation pass.
+
+### Maintenance activity claims and retries
+
+The 0.5.15+schedule.2 maintenance engine claims an activity only after its scheduled
+time and while its parent is running, not archived, and has no committed cancellation
+request. PostgreSQL locks the parent before updating the activity; SQLite uses its
+existing immediate transaction. Retry updates compare the previous attempt and state,
+so a duplicate or stale retry cannot shorten the next attempt's deadline.
+
+These guards preserve the legacy APIs and schemas. Cancellation still spans multiple
+writes; rejecting a committed cancellation request does not establish linearizability
+for every overlapping cancellation and claim.

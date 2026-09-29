@@ -86,7 +86,7 @@ jobs:
           SOURCE_REPOSITORY: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
-          EXPECTED_ENGINE_VERSION: 0.5.15+schedule.1
+          EXPECTED_ENGINE_VERSION: 0.5.15+schedule.2
         run: python3 .github/release/package-engine-backport.py
       - uses: actions/upload-artifact@v4
         with:
