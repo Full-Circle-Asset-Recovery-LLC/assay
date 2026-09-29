@@ -674,7 +674,7 @@ transactional fencing across an entire schedule evaluation pass.
 ### Maintenance activity claims and retries
 
 The 0.5.15+schedule.2 maintenance engine claims an activity only after its scheduled
-time and while its parent is running, not archived, and has no committed cancellation
+time and while its parent is active (PENDING, RUNNING, or WAITING), not archived, and has no committed cancellation
 request. PostgreSQL locks the parent before updating the activity; SQLite uses its
 existing immediate transaction. Retry updates compare the previous attempt and state,
 so a duplicate or stale retry cannot shorten the next attempt's deadline.
