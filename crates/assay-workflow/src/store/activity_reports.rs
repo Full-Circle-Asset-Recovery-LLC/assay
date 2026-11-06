@@ -62,3 +62,20 @@ pub(super) fn plan_report<'a>(
         payload: failed_event_payload(act.id?, act.seq, &act.name, error, act.attempt).to_string(),
     })
 }
+
+/// A generation protects a claim independently of retry counters and legacy writers.
+pub(super) fn generation_matches(
+    act: &WorkflowActivity,
+    fence: crate::types::ActivityFence<'_>,
+) -> bool {
+    match act.claim_generation {
+        Some(generation) => {
+            generation > 0
+                && fence.expected_claim_generation == Some(generation)
+                && fence.claimed_by.is_some_and(|owner| {
+                    !owner.trim().is_empty() && act.claimed_by.as_deref() == Some(owner)
+                })
+        }
+        None => fence.expected_claim_generation.is_none(),
+    }
+}

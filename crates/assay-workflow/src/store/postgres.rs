@@ -8,12 +8,12 @@ use crate::store::{
 };
 use crate::types::*;
 
-const RETRY_ACTIVITY_SELECT: &str = "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat FROM workflow.activities WHERE workflow_id = $1 AND status = 'FAILED' ORDER BY seq DESC LIMIT 1 FOR UPDATE";
+const RETRY_ACTIVITY_SELECT: &str = "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation FROM workflow.activities WHERE workflow_id = $1 AND status = 'FAILED' ORDER BY seq DESC LIMIT 1 FOR UPDATE";
 /// Terminal activities whose workflow is still live and whose terminal
 /// history event never landed — the half-settled state the transactional
 /// settle path can no longer create, and older rows can still be in.
-const UNSETTLED_ACTIVITY_SELECT: &str = "SELECT a.id, a.workflow_id, a.seq, a.name, a.task_queue, a.input, a.status, a.result, a.error, a.attempt, a.max_attempts, a.initial_interval_secs, a.backoff_coefficient, a.start_to_close_secs, a.heartbeat_timeout_secs, a.claimed_by, a.scheduled_at, a.started_at, a.completed_at, a.last_heartbeat FROM workflow.activities a JOIN workflow.workflows w ON w.id = a.workflow_id WHERE a.status IN ('COMPLETED', 'FAILED') AND w.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT') AND w.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = a.workflow_id AND e.activity_id = a.id AND e.event_type IN ('ActivityCompleted', 'ActivityFailed')) ORDER BY a.completed_at ASC LIMIT $1";
-const RETRY_ACTIVITY_UPDATE: &str = "UPDATE workflow.activities SET status = 'PENDING', result = NULL, error = NULL, attempt = 1, claimed_by = NULL, scheduled_at = $1, started_at = NULL, completed_at = NULL, last_heartbeat = NULL WHERE id = $2 RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat";
+const UNSETTLED_ACTIVITY_SELECT: &str = "SELECT a.id, a.workflow_id, a.seq, a.name, a.task_queue, a.input, a.status, a.result, a.error, a.attempt, a.max_attempts, a.initial_interval_secs, a.backoff_coefficient, a.start_to_close_secs, a.heartbeat_timeout_secs, a.claimed_by, a.scheduled_at, a.started_at, a.completed_at, a.last_heartbeat, a.claim_generation FROM workflow.activities a JOIN workflow.workflows w ON w.id = a.workflow_id WHERE a.status IN ('COMPLETED', 'FAILED') AND w.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT') AND w.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = a.workflow_id AND e.activity_id = a.id AND e.event_type IN ('ActivityCompleted', 'ActivityFailed')) ORDER BY a.completed_at ASC LIMIT $1";
+const RETRY_ACTIVITY_UPDATE: &str = "UPDATE workflow.activities SET status = 'PENDING', result = NULL, error = NULL, attempt = 1, claimed_by = NULL, scheduled_at = $1, started_at = NULL, completed_at = NULL, last_heartbeat = NULL WHERE id = $2 RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation";
 
 /// v0.1.2 schema layout: workflow tables live in the `workflow` schema;
 /// the engine-events outbox lives in the `engine` schema (created
@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS workflow.activities (
     result          TEXT,
     error           TEXT,
     attempt         INTEGER NOT NULL DEFAULT 1,
+    claim_generation BIGINT CHECK (claim_generation IS NULL OR claim_generation >= 0),
     max_attempts    INTEGER NOT NULL DEFAULT 3,
     initial_interval_secs   DOUBLE PRECISION NOT NULL DEFAULT 1,
     backoff_coefficient     DOUBLE PRECISION NOT NULL DEFAULT 2,
@@ -262,6 +263,7 @@ impl PostgresStore {
         )
         .execute(&mut *tx)
         .await?;
+        sqlx::query("ALTER TABLE workflow.activities ADD COLUMN IF NOT EXISTS claim_generation BIGINT CHECK (claim_generation IS NULL OR claim_generation >= 0)").execute(&mut *tx).await?;
         sqlx::query("ALTER TABLE workflow.events ADD COLUMN IF NOT EXISTS activity_id BIGINT")
             .execute(&mut *tx)
             .await?;
@@ -320,6 +322,10 @@ impl PostgresStore {
 }
 
 impl WorkflowStore for PostgresStore {
+    fn supports_activity_claim_generation_fencing(&self) -> bool {
+        true
+    }
+
     fn supports_activity_fencing(&self) -> bool {
         true
     }
@@ -710,8 +716,8 @@ impl WorkflowStore for PostgresStore {
 
     async fn create_activity(&self, act: &WorkflowActivity) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO workflow.activities (workflow_id, seq, name, task_queue, input, status, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, scheduled_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+            "INSERT INTO workflow.activities (workflow_id, seq, name, task_queue, input, status, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, scheduled_at, claim_generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
         )
         .bind(&act.workflow_id)
         .bind(act.seq)
@@ -726,6 +732,7 @@ impl WorkflowStore for PostgresStore {
         .bind(act.start_to_close_secs)
         .bind(act.heartbeat_timeout_secs)
         .bind(act.scheduled_at)
+        .bind(act.claim_generation)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -733,7 +740,7 @@ impl WorkflowStore for PostgresStore {
 
     async fn get_activity(&self, id: i64) -> Result<Option<WorkflowActivity>> {
         let row = sqlx::query_as::<_, PgActivityRow>(
-            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat
+            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation
              FROM workflow.activities WHERE id = $1",
         )
         .bind(id)
@@ -748,7 +755,7 @@ impl WorkflowStore for PostgresStore {
         seq: i32,
     ) -> Result<Option<WorkflowActivity>> {
         let row = sqlx::query_as::<_, PgActivityRow>(
-            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat
+            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation
              FROM workflow.activities WHERE workflow_id = $1 AND seq = $2",
         )
         .bind(workflow_id)
@@ -886,7 +893,7 @@ impl WorkflowStore for PostgresStore {
     ) -> Result<()> {
         let status = if failed { "FAILED" } else { "COMPLETED" };
         sqlx::query(
-            "UPDATE workflow.activities SET status = $1, result = $2, error = $3, completed_at = $4 WHERE id = $5",
+            "UPDATE workflow.activities SET status = $1, result = $2, error = $3, completed_at = $4 WHERE id = $5 AND claim_generation IS NULL",
         )
         .bind(status)
         .bind(result)
@@ -895,11 +902,15 @@ impl WorkflowStore for PostgresStore {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        self.reject_protected_activity(id).await?;
         Ok(())
     }
 
     async fn settle_activity(&self, settlement: &ActivitySettlement<'_>) -> Result<SettleOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
         // Match fenced reports and retries: lock the actual parent before
         // the activity, including the legacy settlement repair path.
         sqlx::query(
@@ -909,15 +920,37 @@ impl WorkflowStore for PostgresStore {
         .bind(settlement.activity_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let current: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM workflow.activities WHERE id = $1 FOR UPDATE")
-                .bind(settlement.activity_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((status,)) = current else {
+        sqlx::query("SELECT id FROM workflow.workflows WHERE id = (SELECT workflow_id FROM workflow.activities WHERE id = $1) FOR UPDATE")
+            .bind(settlement.activity_id).fetch_optional(&mut *tx).await?;
+        let current: Option<(String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT status, claim_generation, workflow_id FROM workflow.activities WHERE id = $1 FOR UPDATE",
+        )
+        .bind(settlement.activity_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, generation, workflow_id)) = current else {
             return Ok(SettleOutcome::Unknown);
         };
         let settled = matches!(status.as_str(), "COMPLETED" | "FAILED");
+        if generation.is_some() && workflow_id != settlement.workflow_id {
+            return Err(ProtectedActivityClaimRequired.into());
+        }
+        if generation.is_some() && (!settled || settlement.expected_claim_generation != generation)
+        {
+            return Err(ProtectedActivityClaimRequired.into());
+        }
+        if generation.is_none() && settlement.expected_claim_generation.is_some() {
+            return Err(ProtectedActivityClaimRequired.into());
+        }
+        if generation.is_some() {
+            let live: Option<(String,)> = sqlx::query_as("SELECT id FROM workflow.workflows w
+                WHERE id = $1 AND status IN ('PENDING', 'RUNNING', 'WAITING') AND archived_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = w.id AND e.event_type = 'WorkflowCancelRequested')")
+                .bind(settlement.workflow_id).fetch_optional(&mut *tx).await?;
+            if live.is_none() {
+                return Err(ProtectedActivityClaimRequired.into());
+            }
+        }
         let event_id: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM workflow.events
              WHERE workflow_id = $1 AND activity_id = $2
@@ -987,17 +1020,18 @@ impl WorkflowStore for PostgresStore {
     }
 
     async fn heartbeat_activity(&self, id: i64, _details: Option<&str>) -> Result<()> {
-        sqlx::query("UPDATE workflow.activities SET last_heartbeat = $1 WHERE id = $2")
+        sqlx::query("UPDATE workflow.activities SET last_heartbeat = $1 WHERE id = $2 AND claim_generation IS NULL")
             .bind(timestamp_now())
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.reject_protected_activity(id).await?;
         Ok(())
     }
 
     async fn get_timed_out_activities(&self, now: f64) -> Result<Vec<WorkflowActivity>> {
         let rows = sqlx::query_as::<_, PgActivityRow>(
-            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat
+            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation
              FROM workflow.activities
              WHERE status = 'RUNNING'
                AND heartbeat_timeout_secs IS NOT NULL
@@ -1625,6 +1659,7 @@ impl From<PgEventRow> for WorkflowEvent {
 
 #[derive(sqlx::FromRow)]
 struct PgActivityRow {
+    claim_generation: Option<i64>,
     id: i64,
     workflow_id: String,
     seq: i32,
@@ -1650,6 +1685,7 @@ struct PgActivityRow {
 impl From<PgActivityRow> for WorkflowActivity {
     fn from(r: PgActivityRow) -> Self {
         Self {
+            claim_generation: r.claim_generation,
             id: Some(r.id),
             workflow_id: r.workflow_id,
             seq: r.seq,

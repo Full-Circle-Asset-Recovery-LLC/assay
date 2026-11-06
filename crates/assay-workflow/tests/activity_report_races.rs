@@ -17,6 +17,7 @@ async fn seed<S: WorkflowStore>(store: &S, due: f64) -> i64 {
         .unwrap();
     store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "wf-fence".into(),
             seq: 1,
@@ -57,6 +58,7 @@ async fn simultaneous_reports_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -96,6 +98,7 @@ async fn waiting_workflow_contract<S: WorkflowStore>(store: &S) {
     assert_eq!(claimed.id, Some(id));
     // The owner is optional; attempt-only callers still receive atomic fencing.
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: None,
     };
@@ -140,6 +143,7 @@ async fn waiting_workflow_contract<S: WorkflowStore>(store: &S) {
             .report_activity(
                 id,
                 ActivityFence {
+                    expected_claim_generation: None,
                     expected_attempt: 2,
                     claimed_by: Some("worker-2")
                 },
@@ -159,6 +163,7 @@ async fn cancellation_report_race_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -256,6 +261,7 @@ async fn timeout_rechecks_heartbeat_and_does_not_fail_cancelled_workflow() {
     let captured = store.get_timed_out_activities(tick).await.unwrap();
     assert_eq!(captured.len(), 1);
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -352,6 +358,7 @@ async fn postgres_legacy_and_fenced_settlement_lock_parent_before_activity() {
     let legacy = tokio::spawn(async move {
         legacy_store
             .settle_activity(&ActivitySettlement {
+                expected_claim_generation: None,
                 activity_id: id,
                 workflow_id: "wf-fence",
                 result: Some("42"),
@@ -379,6 +386,7 @@ async fn postgres_legacy_and_fenced_settlement_lock_parent_before_activity() {
             .report_activity(
                 id,
                 ActivityFence {
+                    expected_claim_generation: None,
                     expected_attempt: 1,
                     claimed_by: Some("worker-1"),
                 },

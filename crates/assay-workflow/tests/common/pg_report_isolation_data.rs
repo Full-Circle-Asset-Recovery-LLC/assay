@@ -135,6 +135,7 @@ async fn seed_history_activity(pool: &PgPool, id: i64) -> Result<()> {
 
 fn activity(workflow: &str, status: &str) -> WorkflowActivity {
     WorkflowActivity {
+        claim_generation: None,
         id: None,
         workflow_id: workflow.into(),
         seq: 1,

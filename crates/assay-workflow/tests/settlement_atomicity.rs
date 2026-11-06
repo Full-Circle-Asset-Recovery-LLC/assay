@@ -37,6 +37,7 @@ async fn seed() -> (SqliteStore, i64) {
         .unwrap();
     let activity_id = store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "wf-settle".to_string(),
             seq: 1,
@@ -65,6 +66,7 @@ async fn seed() -> (SqliteStore, i64) {
 
 fn settlement<'a>(activity_id: i64, payload: &'a str) -> ActivitySettlement<'a> {
     ActivitySettlement {
+        expected_claim_generation: None,
         activity_id,
         workflow_id: "wf-settle",
         result: Some(r#"{"outcome":"repair"}"#),

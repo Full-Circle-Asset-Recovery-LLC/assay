@@ -90,6 +90,7 @@ function M.make(workflow_id, history)
       backoff_coefficient = opts and opts.backoff_coefficient,
       start_to_close_secs = opts and opts.start_to_close_secs,
       heartbeat_timeout_secs = opts and opts.heartbeat_timeout_secs,
+      claim_generation_fencing = opts and opts.claim_generation_fencing,
     })
     error("workflow ctx: yielded but resumed unexpectedly")
   end
@@ -128,6 +129,7 @@ function M.make(workflow_id, history)
           backoff_coefficient = opts.backoff_coefficient,
           start_to_close_secs = opts.start_to_close_secs,
           heartbeat_timeout_secs = opts.heartbeat_timeout_secs,
+          claim_generation_fencing = opts.claim_generation_fencing,
         }
       end
     end

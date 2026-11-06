@@ -21,6 +21,8 @@ pub fn router<S: WorkflowStore + 'static>() -> Router<Arc<WorkflowCtx<S>>> {
 
 #[derive(Deserialize, ToSchema)]
 pub struct ScheduleActivityRequest {
+    /// Require durable generation, attempt and owner on every report.
+    pub claim_generation_fencing: Option<bool>,
     /// Activity name (the worker matches this to a registered handler)
     pub name: String,
     /// Sequence number relative to the workflow. Used for idempotency:
@@ -59,6 +61,7 @@ pub async fn schedule_activity<S: WorkflowStore>(
 ) -> Result<(axum::http::StatusCode, Json<WorkflowActivity>), AppError> {
     let input = req.input.map(|v| v.to_string());
     let opts = ScheduleActivityOpts {
+        claim_generation_fencing: req.claim_generation_fencing,
         max_attempts: req.max_attempts,
         initial_interval_secs: req.initial_interval_secs,
         backoff_coefficient: req.backoff_coefficient,

@@ -229,6 +229,7 @@ async fn pg_activity_claim_concurrent() {
     let ts = now();
     store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "pg-wf-1".to_string(),
             seq: 1,

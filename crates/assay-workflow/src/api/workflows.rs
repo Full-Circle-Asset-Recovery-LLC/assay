@@ -584,6 +584,9 @@ impl AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
+        if e.is::<crate::types::ProtectedActivityClaimRequired>() {
+            return Self::conflict(e.to_string());
+        }
         Self::Internal(e)
     }
 }

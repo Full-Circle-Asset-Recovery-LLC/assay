@@ -54,6 +54,7 @@ pub async fn check_health_at<S: WorkflowStore>(store: &S, now: f64) -> Result<()
                 .report_activity(
                     act_id,
                     crate::types::ActivityFence {
+                        expected_claim_generation: act.claim_generation,
                         expected_attempt: act.attempt,
                         claimed_by: act.claimed_by.as_deref(),
                     },
@@ -128,6 +129,7 @@ pub async fn reconcile_settled_activities<S: WorkflowStore>(store: &S) -> Result
         let payload = settlement_payload(&act, id, failed);
         let outcome = store
             .settle_activity(&ActivitySettlement {
+                expected_claim_generation: act.claim_generation,
                 activity_id: id,
                 workflow_id: &act.workflow_id,
                 result: act.result.as_deref(),

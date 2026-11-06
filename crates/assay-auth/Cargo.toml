@@ -54,7 +54,7 @@ backend-postgres = ["dep:sqlx", "sqlx/postgres", "assay-domain/backend-postgres"
 backend-sqlite = ["dep:sqlx", "sqlx/sqlite"]
 
 [dependencies]
-assay-domain = { path = "../assay-domain", version = "0.2.5" }
+assay-domain = { path = "../assay-domain", version = "0.3" }
 
 # Shared primitives — small, used unconditionally
 anyhow = "1"

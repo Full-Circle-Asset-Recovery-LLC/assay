@@ -75,7 +75,7 @@ backend-sqlite = ["dep:sqlx", "sqlx/sqlite"]
 # vault crate has no dependency on the auth crate — making vault
 # genuinely standalone for non-BW deployments.
 assay-auth = { path = "../assay-auth", version = "0.6", optional = true }
-assay-domain = { path = "../assay-domain", version = "0.2.5" }
+assay-domain = { path = "../assay-domain", version = "0.3" }
 
 # Phase 0 holds the dep set deliberately small: just what the schema
 # bootstrap, ctx skeleton, and smoke test need. Subsequent phases

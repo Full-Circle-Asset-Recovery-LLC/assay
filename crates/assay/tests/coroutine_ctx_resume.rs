@@ -127,3 +127,10 @@ async fn activity_retry_boundary_discards_failure_path_activity_results() {
     "#;
     run_lua(script).await.unwrap();
 }
+
+#[tokio::test]
+async fn activity_builders_preserve_explicit_claim_generation_options() {
+    run_lua(include_str!("workflow_lua/claim_generation.lua"))
+        .await
+        .unwrap();
+}

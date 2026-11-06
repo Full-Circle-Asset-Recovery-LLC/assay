@@ -15,6 +15,7 @@ async fn seed<S: WorkflowStore>(store: &S, due: f64) -> i64 {
         .unwrap();
     store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "wf-fence".into(),
             seq: 1,
@@ -286,6 +287,7 @@ async fn postgres_legacy_settlement_locks_parent_before_activity() {
     let legacy = tokio::spawn(async move {
         legacy_store
             .settle_activity(&ActivitySettlement {
+                expected_claim_generation: None,
                 activity_id: id,
                 workflow_id: "wf-fence",
                 result: Some("42"),

@@ -498,6 +498,7 @@ fn make_activity(
         .unwrap()
         .as_secs_f64();
     assay_domain::types::WorkflowActivity {
+        claim_generation: None,
         id: None,
         workflow_id: workflow_id.to_string(),
         seq,
