@@ -63,3 +63,57 @@ verbatim, restrict activity edits to their function and named column projection,
 complete SQL diff for matching changed columns, values and bindings. Proof: rerun the existing
 schedule/API and full backend suites without editing their assertions. This is patch containment,
 with no new runtime abstraction or behavior change outside protected activities.
+
+## Hosted runner compatibility
+
+### Class
+
+Hosted runner selectors can resolve to an operating system unsupported by the pinned toolchain or to
+a retired image, preventing required checks from reaching application tests.
+
+### Mechanism
+
+CI run `42313339806`, dashboard job `128219918113`, checked out
+`301090e64a8071ef80adf38b95dbe454ca295530` on hosted image `ubuntu-26.04` version `20261101.186.1`.
+The locked Playwright 1.59.1 installer rejected `ubuntu26.04-x64` on all three attempts. No
+dashboard assertions or engine/worker fixtures ran. The workflow's hosted fallback was
+`ubuntu-latest`; its SHA256 `33c174a11bb9095ae8583b8085f2ce5a38f5a14b756e7397557447b44b175d10` was
+identical at source base `c43db57c10f1b8657eb42caf909df13c0d1401b2` and the checked-out head.
+Browser lockfile, Moon task, test specification and installer were also unchanged by the source
+repair. This is deterministic tooling/image incompatibility rather than a dashboard test defect or
+transient download failure.
+
+The same run's macOS job `128219918127` was cancelled before runner assignment: its runner name and
+steps were empty, logs were unavailable, and the check annotation said
+`The configuration 'macos-14-arm64-us-default' is not supported`. GitHub retired macOS 14 images on
+November 2, 2026. The existing matrix and ARM64 target were unchanged by the source repair. Branch
+protection explicitly requires `check (macos-14, aarch64-apple-darwin)`, so simply renaming the
+matrix row would leave a required context unsatisfied.
+
+### Structural fix
+
+Pin only the dashboard job's hosted fallback to the explicitly supported `ubuntu-24.04` label.
+Preserve its existing self-hosted condition, all browser/package versions, retry behavior, install
+commands, test commands, artifact handling and required checks. The supported operating system must
+be a deliberate toolchain input rather than following a moving `latest` alias. Keep `macos-14` only
+as the legacy required-status identifier and self-hosted selector, while mapping its hosted fallback
+to supported ARM64 `macos-15`. Preserve the existing `aarch64-apple-darwin` target, self-hosted
+opt-in and all required status names; do not change branch protection. No protocol source or release
+workflow changes are needed.
+
+### Proof
+
+The original failed job log and image metadata are retained outside the source tree. Playwright's
+[exact v1.59.1 requirements](https://github.com/microsoft/playwright/blob/v1.59.1/docs/src/intro-js.md#system-requirements)
+list Ubuntu 22.04 and 24.04; its
+[tagged host-platform implementation](https://github.com/microsoft/playwright/blob/v1.59.1/packages/playwright-core/src/server/utils/hostPlatform.ts#L82-L84)
+marks Ubuntu 24.04 supported and versions at or above 26 unsupported. GitHub's
+[runner image inventory](https://github.com/actions/runner-images#available-images) provides the
+`ubuntu-24.04` x64 and `macos-15` ARM64 labels. The provider's
+[macOS 14 retirement notice](https://github.com/actions/runner-images/issues/13518) establishes that
+the old image cannot be repaired by retrying. Validate that parsed YAML differs only in the two
+hosted runner selections; evaluate maintainer/other-actor and macOS opt-in true/false/unset routing,
+retaining Linux paths, required matrix identifiers, install/test steps and the ARM64 target. Require
+fresh CI metadata to show actual macOS 15 ARM64 and Ubuntu 24.04 runners under the unchanged
+required contexts. Local configuration validation is not application acceptance. A same-image blind
+rerun cannot fix either incompatibility.
