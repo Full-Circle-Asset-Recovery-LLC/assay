@@ -209,6 +209,7 @@ async fn start_workers(
             .report_activity(
                 activity,
                 ActivityFence {
+                    expected_claim_generation: None,
                     expected_attempt: 2,
                     claimed_by: Some(data::OWNER),
                 },

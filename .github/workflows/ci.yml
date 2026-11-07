@@ -124,13 +124,16 @@ jobs:
     # GitHub Actions cannot fall back from an offline self-hosted runner
     # once a job has been routed there, so this stays a deliberate toggle
     # rather than a default — flip the variable and the next run goes back
-    # to GitHub-hosted `macos-14` with no workflow edit:
+    # to GitHub-hosted ARM64 `macos-15` with no workflow edit. `macos-14`
+    # remains only the legacy required-status identifier and selector;
+    # its hosted image is retired, so the fallback maps it to `macos-15`:
     #
     #   gh variable set MAC_LOCAL_RUNNER --repo developerinlondon/assay --body false
     runs-on: >-
       ${{
         (matrix.os == 'ubuntu-latest' && github.actor == 'developerinlondon' && fromJSON('["self-hosted","linux","assay"]'))
         || (matrix.os == 'macos-14' && github.actor == 'developerinlondon' && vars.MAC_LOCAL_RUNNER == 'true' && fromJSON('["self-hosted","macos","assay"]'))
+        || (matrix.os == 'macos-14' && 'macos-15')
         || matrix.os
       }}
     # A cold self-hosted build installs the toolchain and fills an empty
@@ -511,6 +514,7 @@ jobs:
         run: |
           python3 .github/release/test_extract_changelog.py
           python3 .github/ci/test_artifact_packaging.py
+          python3 .github/ci/test_assay_engine_baseline_darwin.py
 
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/deploy.yml
@@ -519,7 +523,7 @@ jobs:
     name: dashboard-e2e
     needs: changes
     if: needs.changes.outputs.dashboard_e2e == 'true'
-    runs-on: ${{ github.actor == 'developerinlondon' && fromJSON('["self-hosted","linux","assay"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.actor == 'developerinlondon' && fromJSON('["self-hosted","linux","assay"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6

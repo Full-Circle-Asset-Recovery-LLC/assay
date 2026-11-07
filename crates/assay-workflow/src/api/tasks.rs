@@ -151,6 +151,8 @@ pub struct CompleteTaskBody {
 
 #[derive(Deserialize, ToSchema)]
 pub(super) struct CompleteTaskReportBody {
+    /// Required for protected claims; copied from the claimed activity.
+    expected_claim_generation: Option<i64>,
     /// Optional positive claim attempt. Opts into transactional ownership fencing.
     expected_attempt: Option<i32>,
     /// Optional claim owner; requires expected_attempt when supplied.
@@ -175,6 +177,7 @@ pub async fn complete_task<S: WorkflowStore>(
         State(state),
         Path(id),
         Json(CompleteTaskReportBody {
+            expected_claim_generation: None,
             expected_attempt: None,
             claimed_by: None,
             result: body.result,
@@ -189,7 +192,11 @@ async fn complete_task_report<S: WorkflowStore>(
     Json(body): Json<CompleteTaskReportBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
     let result = body.result.map(|v| v.to_string());
-    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+    if let Some(fence) = report_fence(
+        body.expected_attempt,
+        body.claimed_by.as_deref(),
+        body.expected_claim_generation,
+    )? {
         return Ok(report_status(
             state
                 .complete_activity_fenced(id, result.as_deref(), fence)
@@ -210,6 +217,8 @@ pub struct FailTaskBody {
 
 #[derive(Deserialize, ToSchema)]
 pub(super) struct FailTaskReportBody {
+    /// Required for protected claims; copied from the claimed activity.
+    expected_claim_generation: Option<i64>,
     /// Optional positive claim attempt. Opts into transactional ownership fencing.
     expected_attempt: Option<i32>,
     /// Optional claim owner; requires expected_attempt when supplied.
@@ -234,6 +243,7 @@ pub async fn fail_task<S: WorkflowStore>(
         State(state),
         Path(id),
         Json(FailTaskReportBody {
+            expected_claim_generation: None,
             expected_attempt: None,
             claimed_by: None,
             error: body.error,
@@ -250,7 +260,11 @@ async fn fail_task_report<S: WorkflowStore>(
     // fail_activity honors the activity's retry policy: re-queues with
     // backoff while attempts remain, otherwise marks FAILED + appends
     // ActivityFailed event.
-    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+    if let Some(fence) = report_fence(
+        body.expected_attempt,
+        body.claimed_by.as_deref(),
+        body.expected_claim_generation,
+    )? {
         return Ok(report_status(
             state.fail_activity_fenced(id, &body.error, fence).await?,
         ));
@@ -266,6 +280,8 @@ pub struct HeartbeatTaskBody {
 
 #[derive(Deserialize, ToSchema)]
 pub(super) struct HeartbeatTaskReportBody {
+    /// Required for protected claims; copied from the claimed activity.
+    expected_claim_generation: Option<i64>,
     /// Optional positive claim attempt. Opts into transactional ownership fencing.
     expected_attempt: Option<i32>,
     /// Optional claim owner; requires expected_attempt when supplied.
@@ -289,6 +305,7 @@ pub async fn heartbeat_task<S: WorkflowStore>(
         State(state),
         Path(id),
         Json(HeartbeatTaskReportBody {
+            expected_claim_generation: None,
             expected_attempt: None,
             claimed_by: None,
             details: body.details,
@@ -302,7 +319,11 @@ async fn heartbeat_task_report<S: WorkflowStore>(
     Path(id): Path<i64>,
     Json(body): Json<HeartbeatTaskReportBody>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    if let Some(fence) = report_fence(body.expected_attempt, body.claimed_by.as_deref())? {
+    if let Some(fence) = report_fence(
+        body.expected_attempt,
+        body.claimed_by.as_deref(),
+        body.expected_claim_generation,
+    )? {
         return Ok(report_status(
             state
                 .heartbeat_activity_fenced(id, body.details.as_deref(), fence)
@@ -318,9 +339,21 @@ async fn heartbeat_task_report<S: WorkflowStore>(
 fn report_fence(
     expected_attempt: Option<i32>,
     claimed_by: Option<&str>,
+    expected_claim_generation: Option<i64>,
 ) -> Result<Option<ActivityFence<'_>>, AppError> {
+    if expected_claim_generation.is_some()
+        && (expected_claim_generation.is_some_and(|g| g <= 0)
+            || expected_attempt.is_none_or(|a| a <= 0)
+            || claimed_by.is_none_or(|owner| owner.trim().is_empty()))
+    {
+        return Err(AppError::bad_request(
+            "a protected report requires positive generation and attempt and a nonblank owner"
+                .into(),
+        ));
+    }
     match expected_attempt {
         Some(attempt) if attempt > 0 => Ok(Some(ActivityFence {
+            expected_claim_generation,
             expected_attempt: attempt,
             claimed_by,
         })),

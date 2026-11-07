@@ -1,6 +1,6 @@
 [package]
 name = "assay-engine"
-version = "0.6.0"
+version = "0.7.0"
 categories = ["asynchronous", "database", "web-programming::http-server"]
 edition = "2024"
 keywords = ["workflow", "auth", "oidc", "zanzibar", "postgres"]
@@ -100,9 +100,9 @@ backend-sqlite = [
 [dependencies]
 assay-auth = { path = "../assay-auth", version = "0.6" }
 assay-dashboard = { path = "../assay-dashboard", version = "0.6" }
-assay-domain = { path = "../assay-domain", version = "0.2.5" }
+assay-domain = { path = "../assay-domain", version = "0.3" }
 assay-vault = { path = "../assay-vault", version = "0.6", optional = true, default-features = false }
-assay-workflow = { path = "../assay-workflow", version = "0.4" }
+assay-workflow = { path = "../assay-workflow", version = "0.5" }
 
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"], optional = true }

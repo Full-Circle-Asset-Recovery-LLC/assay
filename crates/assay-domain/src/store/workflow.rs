@@ -184,6 +184,11 @@ pub trait WorkflowStore: Send + Sync + 'static {
         false
     }
 
+    /// Durable generations fence every writer of an explicitly protected activity.
+    fn supports_activity_claim_generation_fencing(&self) -> bool {
+        false
+    }
+
     /// Whether activity claims enforce their due time and live workflow guard.
     fn supports_activity_due_time_claims(&self) -> bool {
         false

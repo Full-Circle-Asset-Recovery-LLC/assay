@@ -17,6 +17,7 @@ async fn seed<S: WorkflowStore>(store: &S, due: f64) -> i64 {
         .unwrap();
     store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "wf-fence".into(),
             seq: 1,
@@ -57,10 +58,12 @@ async fn fenced_reports_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
     let stale = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 2,
         ..fence
     };
@@ -157,6 +160,7 @@ async fn cancellation_request_contract<S: WorkflowStore>(store: &S) {
         .await
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -201,6 +205,7 @@ async fn terminal_completion_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -264,6 +269,7 @@ async fn terminal_parent_reports_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };
@@ -360,6 +366,7 @@ async fn fenced_event_failure_rolls_back_every_write() {
         .report_activity(
             id,
             ActivityFence {
+                expected_claim_generation: None,
                 expected_attempt: 1,
                 claimed_by: Some("worker-1"),
             },
@@ -391,6 +398,7 @@ async fn monotonic_heartbeat_contract<S: WorkflowStore>(store: &S) {
         .unwrap()
         .unwrap();
     let fence = ActivityFence {
+        expected_claim_generation: None,
         expected_attempt: 1,
         claimed_by: Some("worker-1"),
     };

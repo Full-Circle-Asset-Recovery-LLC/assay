@@ -217,6 +217,8 @@ pub struct WorkflowEvent {
 /// still letting workflows tune retry/timeout policy when they need to.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct ScheduleActivityOpts {
+    /// Opt in to durable claim generations; omitted activities retain legacy semantics.
+    pub claim_generation_fencing: Option<bool>,
     pub max_attempts: Option<i32>,
     pub initial_interval_secs: Option<f64>,
     pub backoff_coefficient: Option<f64>,
@@ -226,6 +228,9 @@ pub struct ScheduleActivityOpts {
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct WorkflowActivity {
+    /// NULL for legacy activities; zero before the first protected claim.
+    #[serde(default)]
+    pub claim_generation: Option<i64>,
     pub id: Option<i64>,
     pub workflow_id: String,
     pub seq: i32,
@@ -377,6 +382,8 @@ pub struct QueueStats {
 /// in one transaction.
 #[derive(Clone, Debug)]
 pub struct ActivitySettlement<'a> {
+    /// Captured generation, required only for terminal protected-row repair.
+    pub expected_claim_generation: Option<i64>,
     pub activity_id: i64,
     pub workflow_id: &'a str,
     pub result: Option<&'a str>,
@@ -409,6 +416,7 @@ pub enum SettleOutcome {
 /// while this attempt is RUNNING and its workflow has not requested cancellation.
 #[derive(Clone, Copy, Debug)]
 pub struct ActivityFence<'a> {
+    pub expected_claim_generation: Option<i64>,
     pub expected_attempt: i32,
     pub claimed_by: Option<&'a str>,
 }
@@ -428,3 +436,8 @@ pub enum ActivityReport<'a> {
     /// Rechecks the current timeout inside the transaction before applying it.
     Timeout,
 }
+
+/// A legacy writer cannot mutate an activity protected by a durable generation.
+#[derive(Debug, thiserror::Error)]
+#[error("protected activity requires its current claim generation, attempt and owner")]
+pub struct ProtectedActivityClaimRequired;

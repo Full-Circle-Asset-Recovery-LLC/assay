@@ -30,17 +30,28 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
         task_queue: &str,
         opts: ScheduleActivityOpts,
     ) -> Result<WorkflowActivity> {
+        anyhow::ensure!(
+            !opts.claim_generation_fencing.unwrap_or(false)
+                || self.store.supports_activity_claim_generation_fencing(),
+            crate::types::ProtectedActivityClaimRequired
+        );
         // Idempotency: short-circuit if (workflow_id, seq) already exists.
         if let Some(existing) = self
             .store
             .get_activity_by_workflow_seq(workflow_id, seq)
             .await?
         {
+            anyhow::ensure!(
+                existing.claim_generation.is_some()
+                    == opts.claim_generation_fencing.unwrap_or(false),
+                crate::types::ProtectedActivityClaimRequired
+            );
             return Ok(existing);
         }
 
         let now = timestamp_now();
         let mut act = WorkflowActivity {
+            claim_generation: opts.claim_generation_fencing.unwrap_or(false).then_some(0),
             id: None,
             workflow_id: workflow_id.to_string(),
             seq,
@@ -198,6 +209,7 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
         let outcome = self
             .store
             .settle_activity(&ActivitySettlement {
+                expected_claim_generation: None,
                 activity_id: id,
                 workflow_id: &act.workflow_id,
                 result,
@@ -250,6 +262,7 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
         let payload = failed_event_payload(id, act.seq, &act.name, error, act.attempt).to_string();
         self.store
             .settle_activity(&ActivitySettlement {
+                expected_claim_generation: None,
                 activity_id: id,
                 workflow_id: &act.workflow_id,
                 result: None,

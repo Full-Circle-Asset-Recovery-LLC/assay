@@ -74,6 +74,9 @@ impl<S: WorkflowStore> WorkflowCtx<S> {
                         .unwrap_or("default");
                     let input = cmd.get("input").map(|v| v.to_string());
                     let opts = ScheduleActivityOpts {
+                        claim_generation_fencing: cmd
+                            .get("claim_generation_fencing")
+                            .and_then(|v| v.as_bool()),
                         max_attempts: cmd
                             .get("max_attempts")
                             .and_then(|v| v.as_i64())

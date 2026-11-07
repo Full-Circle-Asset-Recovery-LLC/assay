@@ -17,6 +17,7 @@ async fn seed<S: WorkflowStore>(store: &S, due: f64) -> i64 {
         .unwrap();
     store
         .create_activity(&WorkflowActivity {
+            claim_generation: None,
             id: None,
             workflow_id: "wf-fence".into(),
             seq: 1,

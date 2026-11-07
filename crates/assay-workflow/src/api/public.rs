@@ -49,6 +49,7 @@ async fn health_with_capabilities<S: WorkflowStore>(
     let Json(mut health) = health_check().await;
     health["capabilities"] = serde_json::json!({
         "activity_attempt_fencing": state.store.supports_activity_fencing(),
+        "activity_claim_generation_fencing": state.store.supports_activity_claim_generation_fencing(),
         "activity_due_time_claims": state.store.supports_activity_due_time_claims(),
     });
     Json(health)

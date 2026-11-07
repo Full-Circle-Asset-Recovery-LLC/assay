@@ -663,51 +663,77 @@ assay workflow wait deploy-1234 --timeout 300   # exit 0 on COMPLETED, 1 on fail
 
 ### Attempt-fenced activity reports
 
-Workers that need stale-attempt protection must check
-`GET /api/v1/engine/workflow/health` before accepting work. Require both
-`capabilities.activity_attempt_fencing` and
-`capabilities.activity_due_time_claims` to be JSON `true`. Missing fields or
-`false` mean the store does not advertise this contract. The health route remains
-public. Version strings alone do not establish support.
+Workers that need stale-attempt protection must check `GET /api/v1/engine/workflow/health` before
+accepting work. Require both `capabilities.activity_attempt_fencing` and
+`capabilities.activity_due_time_claims` to be JSON `true`. Missing fields or `false` mean the store
+does not advertise this contract. The health route remains public. Version strings alone do not
+establish support.
 
 The existing activity report routes accept two optional top-level fields:
 
-| Field | Meaning |
-|---|---|
-| `expected_attempt` | Positive integer copied from the claimed task's `attempt` |
-| `claimed_by` | Optional worker ID copied from the claimed task's `claimed_by`; requires `expected_attempt` |
+| Field              | Meaning                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| `expected_attempt` | Positive integer copied from the claimed task's `attempt`                                   |
+| `claimed_by`       | Optional worker ID copied from the claimed task's `claimed_by`; requires `expected_attempt` |
 
-For example, send a retryable failure to
-`POST /api/v1/engine/workflow/tasks/123/fail`:
+For example, send a retryable failure to `POST /api/v1/engine/workflow/tasks/123/fail`:
 
 ```json
-{"error":"dependency unavailable","expected_attempt":2,"claimed_by":"worker-1"}
+{ "error": "dependency unavailable", "expected_attempt": 2, "claimed_by": "worker-1" }
 ```
 
-Use the same fence fields with `/tasks/{id}/complete` (`result`) and
-`/tasks/{id}/heartbeat` (`details`). A fenced report returns HTTP 200 only when
-applied. HTTP 409 means the activity is missing, no longer RUNNING, belongs to a
-different attempt or owner, or its workflow is terminal or has requested
-cancellation. Rejection writes no activity row, history event, or dispatch marker.
-An invalid fence returns HTTP 400. Omitting both fields retains the legacy API.
+Use the same fence fields with `/tasks/{id}/complete` (`result`) and `/tasks/{id}/heartbeat`
+(`details`). A fenced report returns HTTP 200 only when applied. HTTP 409 means the activity is
+missing, no longer RUNNING, belongs to a different attempt or owner, or its workflow is terminal or
+has requested cancellation. Rejection writes no activity row, history event, or dispatch marker. An
+invalid fence returns HTTP 400. Omitting both fields retains the legacy API.
 
-The built-in SQLite and PostgreSQL stores check the fence and workflow state in
-the transaction that applies the report. Completion stores its result, history
-event, and dispatch marker together. Failure advances a running attempt once and
-sets the retry deadline. Claims exclude future deadlines, terminal workflows, and
-workflows with a `WorkflowCancelRequested` event. Heartbeats use the same fence;
-workers can use them to check the current lease before starting work. A successful
-heartbeat is not a lock on later external effects. Check ownership again before
-publishing an external result.
+The built-in SQLite and PostgreSQL stores check the fence and workflow state in the transaction that
+applies the report. Completion stores its result, history event, and dispatch marker together.
+Failure advances a running attempt once and sets the retry deadline. Claims exclude future
+deadlines, terminal workflows, and workflows with a `WorkflowCancelRequested` event. Heartbeats use
+the same fence; workers can use them to check the current lease before starting work. A successful
+heartbeat is not a lock on later external effects. Check ownership again before publishing an
+external result.
 
 Rust embedders can use `complete_activity_fenced`, `fail_activity_fenced`, and
 `heartbeat_activity_fenced` on `WorkflowCtx`. Stores implement the additive
-`WorkflowStore::report_activity` operation with `ActivityFence` and
-`ActivityReport`. Custom stores default to unsupported capabilities and rejected
-fenced reports. Legacy settlement and its repair API remain available.
+`WorkflowStore::report_activity` operation with `ActivityFence` and `ActivityReport`. Custom stores
+default to unsupported capabilities and rejected fenced reports. Legacy settlement and its repair
+API remain available.
 
-The fence compares the current attempt and, when supplied, its owner. It is not a
-lease generation across an operator retry that resets `attempt` to 1. A worker
-that needs protection across those resets must use a separate application-level
-generation or reject reset deliveries. This change preserves the existing
-operator retry budget and reset behavior.
+The fence compares the current attempt and, when supplied, its owner. It is not a lease generation
+across an operator retry that resets `attempt` to 1. A worker that needs protection across those
+resets must use a separate application-level generation or reject reset deliveries. This change
+preserves the existing operator retry budget and reset behavior.
+
+## Protected activity claims
+
+Schedule an activity with `claim_generation_fencing: true` to require durable claim identity. The
+option is available in the scheduling REST request, workflow command batch, and both Lua activity
+builders. Repeating a workflow/sequence with a different protection mode is a conflict. Existing
+activities and omitted options retain legacy behavior.
+
+`claim_generation` is `null` for legacy rows, `0` before a protected row's first claim, and a
+positive 64-bit integer on a claimed protected row. Every claim increments it atomically. Automatic
+retry and manual reopen retain the generation; manual retry still resets `attempt` and preserves the
+configured retry budget and backoff. Generation overflow leaves the activity unclaimed.
+
+Protected complete, fail and heartbeat requests include all three fields copied from the claimed
+activity: `expected_claim_generation`, `expected_attempt`, and `claimed_by`. The generation and
+attempt must be positive and the owner nonblank. Missing or stale claim identity cannot fall back to
+legacy mutation. Rejected reports change no activity, history event or dispatch marker. Clients
+should handle HTTP 409 as a lost claim and stop reporting it; malformed protected fences return
+HTTP 400. Legacy id-only storage methods also refuse protected rows.
+
+The public workflow health response advertises `activity_claim_generation_fencing` separately from
+`activity_attempt_fencing` and `activity_due_time_claims`. Clients requiring the protected protocol
+must require all relevant boolean capabilities and verify the returned activity generation; older
+capability flags alone do not establish protection from legacy writers or manual-retry reuse.
+
+The additive nullable-column migrations leave existing rows legacy. This is source preparation;
+production upgrade remains an operator-owned binary/state transaction. Never roll an older binary
+onto a database containing admitted protected work. Pre-acceptance rollback restores the paired
+previous binary and database generation; accepted protected work requires forward recovery or an
+explicit migration. Public registry publication additionally requires republishing dependent crates
+whose published dependency requirements still select the older domain version.

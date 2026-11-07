@@ -39,12 +39,15 @@ impl SqliteStore {
             return Ok(false);
         }
         let current = sqlx::query_as::<_, SqliteActivityRow>(
-            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat FROM workflow.activities WHERE id = ? "
+            "SELECT id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation FROM workflow.activities WHERE id = ? "
         ).bind(id).fetch_optional(&mut *tx).await?;
         let Some(current) = current else {
             return Ok(false);
         };
         let act: WorkflowActivity = current.into();
+        if !super::super::activity_reports::generation_matches(&act, fence) {
+            return Ok(false);
+        }
         if act.status != "RUNNING"
             || act.attempt != fence.expected_attempt
             || fence
@@ -179,7 +182,7 @@ impl SqliteStore {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let candidate: Option<(i64,)> = sqlx::query_as(
             "SELECT a.id FROM workflow.activities a JOIN workflow.workflows w ON w.id = a.workflow_id
-             WHERE a.task_queue = ? AND a.status = 'PENDING' AND a.scheduled_at <= ?
+             WHERE a.task_queue = ? AND a.status = 'PENDING' AND (a.claim_generation IS NULL OR a.claim_generation < 9223372036854775807) AND a.scheduled_at <= ?
                AND w.status IN ('PENDING', 'RUNNING', 'WAITING') AND w.archived_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = w.id
                    AND e.event_type = 'WorkflowCancelRequested')
@@ -190,13 +193,13 @@ impl SqliteStore {
         };
         // A fresh statement observes cancellation committed while acquiring locks.
         let row = sqlx::query_as::<_, SqliteActivityRow>(
-            "UPDATE workflow.activities SET status = 'RUNNING', claimed_by = ?, started_at = ?
-             WHERE id = ? AND status = 'PENDING' AND scheduled_at <= ?
+            "UPDATE workflow.activities SET claim_generation = claim_generation + 1, status = 'RUNNING', claimed_by = ?, started_at = ?
+             WHERE id = ? AND status = 'PENDING' AND (claim_generation IS NULL OR claim_generation < 9223372036854775807) AND scheduled_at <= ?
                AND EXISTS (SELECT 1 FROM workflow.workflows w WHERE w.id = workflow.activities.workflow_id
                    AND w.status IN ('PENDING', 'RUNNING', 'WAITING') AND w.archived_at IS NULL
                    AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = w.id
                        AND e.event_type = 'WorkflowCancelRequested'))
-             RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat"
+             RETURNING id, workflow_id, seq, name, task_queue, input, status, result, error, attempt, max_attempts, initial_interval_secs, backoff_coefficient, start_to_close_secs, heartbeat_timeout_secs, claimed_by, scheduled_at, started_at, completed_at, last_heartbeat, claim_generation"
         ).bind(worker_id).bind(now).bind(id).bind(now).fetch_optional(&mut *tx).await?;
         tx.commit().await?;
         Ok(row.map(Into::into))
@@ -208,6 +211,7 @@ impl SqliteStore {
         next_attempt: i32,
         next_scheduled_at: f64,
     ) -> Result<()> {
+        self.reject_protected_activity(id).await?;
         if next_attempt <= 1 {
             return Ok(());
         }
@@ -222,7 +226,7 @@ impl SqliteStore {
         sqlx::query("UPDATE workflow.activities
             SET status = 'PENDING', attempt = ?, scheduled_at = ?,
                 claimed_by = NULL, started_at = NULL, last_heartbeat = NULL, error = NULL
-            WHERE id = ? AND status IN ('RUNNING', 'FAILED') AND attempt = ?
+            WHERE id = ? AND claim_generation IS NULL AND status IN ('RUNNING', 'FAILED') AND attempt = ?
               AND EXISTS (SELECT 1 FROM workflow.workflows w WHERE w.id = workflow.activities.workflow_id
                 AND w.status IN ('PENDING', 'RUNNING', 'WAITING') AND w.archived_at IS NULL
                 AND NOT EXISTS (SELECT 1 FROM workflow.events e WHERE e.workflow_id = w.id
@@ -230,6 +234,22 @@ impl SqliteStore {
             .bind(next_attempt).bind(next_scheduled_at).bind(id).bind(next_attempt - 1)
             .execute(&mut *tx).await?;
         tx.commit().await?;
+        self.reject_protected_activity(id).await?;
+        Ok(())
+    }
+}
+
+impl SqliteStore {
+    pub(super) async fn reject_protected_activity(&self, id: i64) -> Result<()> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM workflow.activities WHERE id = ? AND claim_generation IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if row.is_some() {
+            return Err(ProtectedActivityClaimRequired.into());
+        }
         Ok(())
     }
 }
