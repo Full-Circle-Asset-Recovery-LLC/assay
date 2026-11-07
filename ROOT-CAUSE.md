@@ -117,3 +117,50 @@ retaining Linux paths, required matrix identifiers, install/test steps and the A
 fresh CI metadata to show actual macOS 15 ARM64 and Ubuntu 24.04 runners under the unchanged
 required contexts. Local configuration validation is not application acceptance. A same-image blind
 rerun cannot fix either incompatibility.
+
+## Historical Darwin baseline ref drift
+
+### Class
+
+A historical baseline's current upstream tag reference may change Git object identity while its
+original immutable tag, source tree and binary remain unchanged. The baseline must retain its
+original attestation and reject changed content without relying on mutable-ref identity alone.
+
+### Mechanism
+
+At head `803286b362adb3445e381842345fa41b32d5949c`, run `42316041715` macOS job `128228835606`
+successfully provisioned image `macos-15-arm64` / `20261104.0514.1`, then the unchanged Darwin
+baseline installer refused the current tag before application tests. The original pinned tag
+`f93223bc34412936217df5932da33c991fab2e02` still names pinned source
+`3977f552391917874589530d0d23094559e68e29`; the current annotated tag
+`b5a13bb929b25da216b5bbf74273c40f04b6062f` names `0c8846dbd2c7375529089c1d73342a330526f4e4`. Both
+exact commit records identify source tree `cf81f118bfe4603ecd26e8ee0ea199cdd890679d`. A fresh
+bounded download retains the original 16,914,848-byte artifact and pinned SHA256
+`b58bd08fa25626d4fce2758d2e871dce4027c5f238d374e040d7ac164a33e7a0`, with an arm64 Mach-O header.
+Tree equality does not establish why the ref changed, signature continuity or a build from the
+current commit.
+
+### Structural fix
+
+Preserve every original manifest and binary pin. Always fetch and validate the original tag object
+by immutable SHA, its exact original commit and a well-formed source tree. Separately validate the
+current ref name and annotated type, tag-object identity/name/direct commit target, and commit
+identity/tree. Re-reading the original tag identity must still return its exact pinned commit; equal
+trees cannot excuse an inconsistent binding for that same immutable tag object. A changed current
+tag is admissible only with exact well-formed tree equality. Missing, malformed, different-tree and
+API-error paths stop before installation or execution. After all retained artifact and
+native-version checks succeed, emit `SAME_TREE_REF_DRIFT` as one structured stderr diagnostic;
+stdout remains only the installed path. Record original/current verification status without claiming
+signature or current-commit build provenance. Stage validated bytes privately and promote only after
+the unchanged native version check passes, retaining the existing directory/executable modes.
+
+### Proof
+
+The new offline fixture first reproduces same-tree provisioning refusal and absence of original
+commit/tree lookup on the old installer. Its positive and negative corpus exercises original and
+current identity, malformed/null metadata, unequal trees, API failures, release/asset checks,
+bounded download, digest, Mach-O, version, permissions and stdout/stderr separation. Synthetic
+artifact metadata exists only in test memory; the checked-in manifest and Rust baseline pins stay
+byte-identical. Offline evidence is not native Darwin execution: the fresh macOS CI job must still
+run the same pinned binary and compatibility tests. Only the Darwin installer, one new offline test
+file, its invocation in the existing workflow lint step and this RCA change.
