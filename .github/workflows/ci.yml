@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Detect what changed so independent surfaces only pay for their own gates.
@@ -100,11 +100,48 @@ jobs:
               - 'rust-toolchain.toml'
               - 'scripts/**'
 
-  check:
+  # Fast parallel linting gate (fmt + clippy) on Ubuntu.
+  # Keeps clippy execution out of the macOS runner, eliminating 7+ minutes
+  # of multi-profile compilation contention on constrained hardware.
+  rust-lint:
+    name: rust-lint
     needs: changes
-    # Required branch-protection check. It always materializes on both
-    # Linux and macOS, but the heavy steps are selected from path filters
-    # so sysops/extension/docs/CI-only diffs do not run the full workspace.
+    if: needs.changes.outputs.assay_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4.0.1
+        with:
+          version: 2026.4.17
+          install: true
+          cache: true
+
+      - name: Install clippy and rustfmt components
+        run: rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-x86_64-unknown-linux-gnu-v4"
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-targets: "true"
+
+      - name: moon run assay-lua:fmt assay-lua:lint
+        run: moon run assay-lua:fmt assay-lua:lint --color
+        env:
+          MOON_LOG: "info"
+
+  # Sharded test execution across Linux and macOS.
+  # Executes cargo test, stdlib tests, and integration suites without
+  # unnecessary release-mode compilation.
+  rust-test:
+    name: rust-test
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -136,12 +173,7 @@ jobs:
         || (matrix.os == 'macos-14' && 'macos-15')
         || matrix.os
       }}
-    # A cold self-hosted build installs the toolchain and fills an empty
-    # target dir; GitHub-hosted macOS already takes ~18 min, so 25 left no
-    # room and killed the first local run before it could finish. Warm runs
-    # reuse the persisted checkout and target dir and are far quicker — this
-    # ceiling exists for the cold case, not the normal one.
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Select check targets
@@ -157,7 +189,7 @@ jobs:
           targets=()
 
           if [[ "$ASSAY_RUST" == "true" ]]; then
-            targets+=(assay-lua:fmt assay-lua:lint assay-lua:build assay-lua:test)
+            targets+=(assay-lua:test)
           elif [[ "$ASSAY_LUA_TESTS" == "true" ]]; then
             targets+=(assay-lua:test-lua-stdlib)
           fi
@@ -182,14 +214,9 @@ jobs:
       - uses: actions/checkout@v6
         if: steps.targets.outputs.run_checks == 'true'
         with:
-          # Full history keeps moon's project graph and VCS metadata
-          # available for any selected target.
           fetch-depth: 0
           persist-credentials: false
 
-      # .mise.toml is the single source of truth for tool versions.
-      # Pinning mise itself avoids a flaky `latest` CDN failure
-      # ("zstd: unexpected end of file" / "tar: child returned status 1").
       - uses: jdx/mise-action@v4.0.1
         if: steps.targets.outputs.run_checks == 'true'
         with:
@@ -197,53 +224,19 @@ jobs:
           install: true
           cache: true
 
-      # On self-hosted, ~/.cargo/bin contains rustup but isn't on the
-      # default GH Actions step PATH. The hosted runners have it because
-      # Swatinem/rust-cache@v2 implicitly installs rustup and prepends
-      # ~/.cargo/bin; we skip that action on self-hosted, so we have to
-      # add it ourselves.
       - name: Add ~/.cargo/bin to PATH (self-hosted)
         if: steps.targets.outputs.run_checks == 'true' && runner.environment == 'self-hosted'
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Keep self-hosted Cargo output off the runner checkout volume. On
-      # assay-runner-eda, /var/cache/runner-work is mounted from the
-      # dedicated cargo-targets LV and is owned by the runner user.
-      # Linux-only: the LV and its path exist on assay-runner-eda alone. The
-      # Mac runner keeps Cargo output in the checkout, where it persists
-      # between runs anyway.
       - name: Use dedicated Cargo target dir (self-hosted)
         if: steps.targets.outputs.run_checks == 'true' && runner.environment == 'self-hosted' && runner.os == 'Linux'
         run: |
           mkdir -p /var/cache/runner-work/assay-target
           echo "CARGO_TARGET_DIR=/var/cache/runner-work/assay-target" >> "$GITHUB_ENV"
-          # Incremental caches buy nothing here — every job compiles from a
-          # cold or near-cold target dir — but they are a large share of what
-          # fills the LV, and a full run exhausts it with "No space left on
-          # device" mid-link.
           echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-          # The lua-test moon tasks invoke the built CLI via the conventional
-          # `target/release/assay` path. With CARGO_TARGET_DIR redirected to the
-          # dedicated LV that path is otherwise empty, so engine-lua:test (and
-          # the sysops/site/workflow-e2e lua tasks) fail with exit 127. Point
-          # `target` at the LV so the conventional path resolves to where cargo
-          # actually writes.
           rm -rf target
           ln -s /var/cache/runner-work/assay-target target
 
-      # mise's rust plugin defaults to the `minimal` profile, which carries
-      # neither clippy nor rustfmt. rust-toolchain.toml names both, but mise
-      # installs the toolchain itself rather than letting rustup resolve that
-      # file, so the components are still added here.
-      - name: Install clippy and rustfmt components
-        if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true'
-        run: rustup component add clippy rustfmt
-
-      # The Shamir transition suite proves migration from the exact deployed
-      # v0.5.15 engine. That binary predates this branch and cannot be rebuilt
-      # from the candidate source. Fetch the deployment-attested artifact from
-      # this fork's historical prerelease, then fail closed on release state,
-      # asset cardinality, byte length, digest, or reported version drift.
       - name: Install pinned assay-engine v0.5.15 baseline (Linux)
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux'
         run: |
@@ -258,23 +251,6 @@ jobs:
           baseline=$(python3 .github/ci/install-assay-engine-baseline-darwin.py "$RUNNER_TEMP/assay-baseline")
           echo "ASSAY_TEST_BASELINE_BINARY=$baseline" >> "$GITHUB_ENV"
 
-      # Swatinem/rust-cache@v2 with a Cargo.lock-keyed cache. The
-      # `key` input ties saves to the locked dep graph, so unchanged
-      # PR pushes hit the exact key (no rebuild) instead of falling
-      # back to a restore-key partial match (rebuild affected crates).
-      # `save-if: contains` skips the ~250MB upload on cache-hit-no-
-      # changes runs.
-      #
-      # `cache-targets: true` keeps target/ in the cache too — main
-      # win is that aws-lc-sys + ring + sqlx-macros + webauthn-rs's
-      # build-script outputs round-trip rather than rebuild. Heavy
-      # build crates dominate cold-restore time on this workspace.
-      #
-      # Skipped on self-hosted: the assay-runner container writes
-      # CARGO_TARGET_DIR to a locally-persistent dedicated LV, and the
-      # post-step's ~250MB upload over the home internet wipes out half
-      # the speedup. Github-hosted (macOS, Dependabot) still needs the
-      # cache.
       - uses: Swatinem/rust-cache@v2
         if: steps.targets.outputs.run_checks == 'true' && runner.environment == 'github-hosted'
         with:
@@ -282,22 +258,7 @@ jobs:
           key: ${{ hashFiles('**/Cargo.lock') }}
           cache-all-crates: "true"
           cache-targets: "true"
-          # Save the cache only on PR runs (Swatinem/rust-cache already
-          # gates internally on job success). Avoids re-uploading ~250MB
-          # for non-PR contexts. `success()` cannot appear in `with:`
-          # inputs — it's restricted to `if:` of jobs/steps.
-          save-if: ${{ github.event_name == 'pull_request' }}
 
-      # Shared Postgres for Ubuntu only. `services:` can't be conditional
-      # in a matrix and macOS GH runners have no Docker. Starting PG once
-      # per job + creating a database per test (via TEST_DATABASE_URL)
-      # eliminates the per-test testcontainer churn that intermittently
-      # hung the docker daemon. macOS is SQLite-only (PG cases cfg-gated
-      # `target_os = "linux"`).
-      #
-      # Skipped on self-hosted: the assay-runner nspawn container has
-      # postgres-18 installed as a systemd service, listening on
-      # localhost:5432 with the same trust-auth credentials.
       - name: Start Postgres 18 (Linux)
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.assay_rust == 'true' && runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: |
@@ -342,12 +303,6 @@ jobs:
           \gexec
           SQL
 
-      # `assay site/build.lua` (the moon `site:build` task above)
-      # rewrites the stdlib table in README.md in place from
-      # docs/modules/*.md frontmatter. If that rewrite produced a diff,
-      # the committed README was out of sync — fail with a clear hint
-      # rather than letting drift slip through. Linux only: macOS would
-      # produce the same result, asserting twice is noise.
       - name: Docs are in sync (README stdlib table)
         if: steps.targets.outputs.run_checks == 'true' && needs.changes.outputs.site == 'true' && runner.os == 'Linux'
         run: |
@@ -355,6 +310,50 @@ jobs:
             echo "::error title=README.md out of sync::Run 'assay site/build.lua' locally and commit the result. The stdlib table is generated from docs/modules/*.md frontmatter; edit those (or build.lua's category_order) — not README directly."
             exit 1
           fi
+
+  # Required branch-protection aggregator check.
+  # Materializes as 'check (ubuntu-latest, x86_64-unknown-linux-gnu)' and
+  # 'check (macos-14, aarch64-apple-darwin)' to preserve 100% of branch-protection
+  # check contexts, running in <5 seconds while aggregating the parallel shards.
+  check:
+    name: check (${{ matrix.os }}, ${{ matrix.target }})
+    needs: [changes, rust-lint, rust-test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Verify aggregated quality gates
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          LINT_RESULT: ${{ needs.rust-lint.result }}
+          TEST_RESULT: ${{ needs.rust-test.result }}
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          echo "Aggregating quality gate results for $TARGET_OS ($TARGET_ARCH)..."
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "::error::changes paths-filter step did not succeed ($CHANGES_RESULT)"
+            exit 1
+          fi
+          if [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]]; then
+            echo "::error::rust-lint quality gate failed or was cancelled ($LINT_RESULT)"
+            exit 1
+          fi
+          if [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]]; then
+            echo "::error::rust-test quality gate failed or was cancelled ($TEST_RESULT)"
+            exit 1
+          fi
+          echo "Quality gates for $TARGET_OS ($TARGET_ARCH) verified successfully."
 
   # Produce the native GNU binary used by source deployments only for the exact
   # commit pushed to main and only after the complete Linux/macOS check matrix
@@ -510,11 +509,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Release changelog regression tests
+      - name: Release changelog and workflow contract regression tests
         run: |
           python3 .github/release/test_extract_changelog.py
           python3 .github/ci/test_artifact_packaging.py
           python3 .github/ci/test_assay_engine_baseline_darwin.py
+          python3 scripts/test_ci_workflow_contract.py
 
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/deploy.yml
@@ -535,6 +535,24 @@ jobs:
           version: 2026.4.17
           install: true
           cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          shared-key: "ci-x86_64-unknown-linux-gnu-v4"
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-targets: "true"
+
+      - name: Cache npm dependencies
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-dashboard-${{ hashFiles('crates/assay-workflow/tests-e2e/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-dashboard-
+            npm-${{ runner.os }}-
 
       - name: Cache Playwright browsers
         if: runner.environment == 'github-hosted'
@@ -589,6 +607,24 @@ jobs:
           version: 2026.4.17
           install: true
           cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          shared-key: "ci-x86_64-unknown-linux-gnu-v4"
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-targets: "true"
+
+      - name: Cache npm dependencies
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-engine-${{ hashFiles('crates/assay-engine/tests-e2e/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-engine-
+            npm-${{ runner.os }}-
 
       - name: Cache Playwright browsers
         if: runner.environment == 'github-hosted'
@@ -668,6 +704,24 @@ jobs:
           install: true
           cache: true
 
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          shared-key: "ci-x86_64-unknown-linux-gnu-v4"
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-targets: "true"
+
+      - name: Cache npm dependencies
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-sysops-${{ hashFiles('libs/sysops/tests-e2e/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-sysops-
+            npm-${{ runner.os }}-
+
       - name: Cache Playwright browsers
         if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
@@ -715,6 +769,14 @@ jobs:
           version: 2026.4.17
           install: true
           cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          shared-key: "ci-x86_64-unknown-linux-gnu-v4"
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          cache-all-crates: "true"
+          cache-targets: "true"
 
       - name: moon run sysops:smoke
         run: moon run sysops:smoke --color
